@@ -2,6 +2,8 @@ import os
 from fastapi import FastAPI, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from services.user_service import get_or_create_primary_user
+
 
 from deps import get_db
 from db import Base, engine
