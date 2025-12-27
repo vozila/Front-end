@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query
@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from deps import get_db
 from db import Base, engine
+from core.security import encrypt_str
 from models import EmailAccount
 from services.user_service import get_or_create_primary_user
 from services.settings_service import (
@@ -140,6 +141,13 @@ class EmailAccountPatch(BaseModel):
     display_name: Optional[str] = Field(default=None, max_length=200)
 
 
+class GmailUpsertRequest(BaseModel):
+    email_address: str = Field(..., min_length=3, max_length=320)
+    display_name: Optional[str] = Field(default=None, max_length=200)
+    oauth_access_token: str = Field(..., min_length=10)
+    oauth_refresh_token: Optional[str] = Field(default=None)
+    expires_in: Optional[int] = Field(default=None, ge=0)
+
 def _to_email_out(a: EmailAccount) -> EmailAccountOut:
     return EmailAccountOut(
         id=str(a.id),
@@ -173,6 +181,82 @@ def list_email_accounts(
         q = q.filter(EmailAccount.is_active == True)  # noqa: E712
     rows = q.order_by(EmailAccount.created_at.desc()).all()
     return [_to_email_out(r) for r in rows]
+
+
+@app.post(
+    "/admin/email-accounts/gmail/upsert",
+    response_model=EmailAccountOut,
+    dependencies=[Depends(require_admin_key)],
+)
+def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_db)):
+    """Create or update a Gmail/Google OAuth EmailAccount for the primary user.
+
+    Notes:
+    - Access/refresh tokens are encrypted at rest using ENCRYPTION_KEY.
+    - If refresh_token is not provided (Google may omit it on subsequent consents),
+      the existing refresh token (if any) is preserved.
+    """
+    user = get_or_create_primary_user(db)
+
+    email_address = payload.email_address.strip().lower()
+    if not email_address:
+        raise HTTPException(status_code=400, detail="email_address is required")
+
+    a = (
+        db.query(EmailAccount)
+        .filter(
+            EmailAccount.user_id == user.id,
+            EmailAccount.provider_type == "gmail",
+            EmailAccount.oauth_provider == "google",
+            EmailAccount.email_address == email_address,
+        )
+        .first()
+    )
+
+    created = False
+    if not a:
+        a = EmailAccount(
+            user_id=user.id,
+            provider_type="gmail",
+            oauth_provider="google",
+            email_address=email_address,
+            display_name=payload.display_name or email_address,
+            is_primary=False,
+            is_active=True,
+        )
+        db.add(a)
+        db.flush()
+        created = True
+
+    # Always update access token
+    a.oauth_access_token = encrypt_str(payload.oauth_access_token)
+
+    # Update refresh token only if provided; otherwise preserve existing
+    if payload.oauth_refresh_token:
+        a.oauth_refresh_token = encrypt_str(payload.oauth_refresh_token)
+
+    if payload.expires_in is not None:
+        a.oauth_expires_at = datetime.utcnow() + timedelta(seconds=int(payload.expires_in))
+
+    if payload.display_name:
+        a.display_name = payload.display_name
+
+    a.is_active = True
+    a.updated_at = datetime.utcnow()
+
+    # Ensure there's a primary
+    any_primary = (
+        db.query(EmailAccount)
+        .filter(EmailAccount.user_id == user.id, EmailAccount.is_primary == True)  # noqa: E712
+        .count()
+        > 0
+    )
+    if not any_primary:
+        a.is_primary = True
+
+    db.commit()
+    db.refresh(a)
+    return _to_email_out(a)
 
 
 @app.patch("/admin/email-accounts/{account_id}", response_model=EmailAccountOut, dependencies=[Depends(require_admin_key)])
