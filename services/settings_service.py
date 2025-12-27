@@ -10,6 +10,7 @@ DEFAULTS = {
     "agent_greeting": {"text": "Hello! How can I assist you today?"},
     "gmail_summary_enabled": {"enabled": True},
     "gmail_account_id": {"account_id": "d8c8cd99-c9bc-4e8c-a560-d220782665a1"},
+    "gmail_enabled_accounts": {"account_ids": []},
     "realtime_prompt_addendum": {
         "text": (
             "CALL OPENING RULE (FIRST UTTERANCE ONLY): "
@@ -72,3 +73,24 @@ def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     if isinstance(account_id, str) and account_id.strip():
         return account_id.strip()
     return None
+
+
+def get_enabled_gmail_account_ids(db: Session, user: User) -> Optional[list[str]]:
+    """Return the allowlist of Gmail account IDs that are enabled/searchable.
+
+    Convention:
+    - None or [] means "no allowlist" → treat as "all active Gmail accounts enabled".
+    """
+    v = get_setting(db, user, "gmail_enabled_accounts")
+    account_ids = (v or {}).get("account_ids")
+    if account_ids is None:
+        return None
+    if isinstance(account_ids, list):
+        cleaned = [str(x).strip() for x in account_ids if str(x).strip()]
+        return cleaned
+    return None
+
+
+def set_enabled_gmail_account_ids(db: Session, user: User, account_ids: list[str]) -> None:
+    cleaned = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
+    set_setting(db, user, "gmail_enabled_accounts", {"account_ids": cleaned})
