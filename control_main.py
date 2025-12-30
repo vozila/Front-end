@@ -1,20 +1,27 @@
+"""
+Vozlia Control Plane (FastAPI)
+- Admin settings + email account admin endpoints
+- Render proxy helpers for Portal UI (services, instances, logs preview, logs export)
+
+Notes:
+- Avoid shadowing `datetime` (Pydantic needs datetime type, not module).
+- Render /v1/logs uses timestamp pagination (hasMore + nextStartTime/nextEndTime); we do NOT pass `limit` upstream.
+"""
+
+from __future__ import annotations
+
 import os
 import json
 import re
 import logging
 import time
+import datetime as dt
 from datetime import datetime, timedelta
-from typing import List, Optional
-from fastapi import HTTPException, Query, Depends
-from typing import List
+from typing import List, Optional, Iterator, Any
 from zoneinfo import ZoneInfo
-import datetime
-
-logger = logging.getLogger("vozlia.control")
-DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -33,6 +40,11 @@ from services.settings_service import (
     set_enabled_gmail_account_ids,
 )
 from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, RenderAPIError
+
+
+logger = logging.getLogger("vozlia.control")
+DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
+NY_TZ = ZoneInfo("America/New_York")
 
 
 # =========================
@@ -196,6 +208,7 @@ class GmailUpsertRequest(BaseModel):
     oauth_refresh_token: Optional[str] = Field(default=None)
     expires_in: Optional[int] = Field(default=None, ge=0)
 
+
 def _to_email_out(a: EmailAccount) -> EmailAccountOut:
     return EmailAccountOut(
         id=str(a.id),
@@ -237,13 +250,7 @@ def list_email_accounts(
     dependencies=[Depends(require_admin_key)],
 )
 def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_db)):
-    """Create or update a Gmail/Google OAuth EmailAccount for the primary user.
-
-    Notes:
-    - Access/refresh tokens are encrypted at rest using ENCRYPTION_KEY.
-    - If refresh_token is not provided (Google may omit it on subsequent consents),
-      the existing refresh token (if any) is preserved.
-    """
+    """Create or update a Gmail/Google OAuth EmailAccount for the primary user."""
     user = get_or_create_primary_user(db)
 
     email_address = payload.email_address.strip().lower()
@@ -261,7 +268,6 @@ def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_
         .first()
     )
 
-    created = False
     if not a:
         a = EmailAccount(
             user_id=user.id,
@@ -274,7 +280,6 @@ def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_
         )
         db.add(a)
         db.flush()
-        created = True
 
     # Always update access token
     a.oauth_access_token = encrypt_str(payload.oauth_access_token)
@@ -323,7 +328,6 @@ def patch_email_account(account_id: str, payload: EmailAccountPatch, db: Session
         a.is_active = bool(data["is_active"])
 
     if data.get("is_primary") is True:
-        # Demote others
         db.query(EmailAccount).filter(
             EmailAccount.user_id == user.id,
             EmailAccount.id != a.id,
@@ -341,11 +345,7 @@ def delete_email_account(
     hard: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
-    """Disconnect an email account.
-
-    - soft (default): set inactive and wipe stored credentials/tokens
-    - hard=true: delete row entirely
-    """
+    """Disconnect an email account."""
     user = get_or_create_primary_user(db)
     a = db.query(EmailAccount).filter(EmailAccount.id == account_id, EmailAccount.user_id == user.id).first()
     if not a:
@@ -356,7 +356,6 @@ def delete_email_account(
         db.commit()
         return {"status": "deleted", "hard": True}
 
-    # soft disconnect
     a.is_active = False
     a.is_primary = False
     a.oauth_access_token = None
@@ -365,6 +364,8 @@ def delete_email_account(
     a.password_enc = None
     db.commit()
     return {"status": "disconnected", "hard": False}
+
+
 # =========================
 # RENDER LOGS (Portal helper)
 # =========================
@@ -376,19 +377,26 @@ class RenderServiceOut(BaseModel):
     owner_id: str | None = None
     region: str | None = None
 
+
 class RenderInstanceOut(BaseModel):
     id: str
     service_id: str | None = None
     status: str | None = None
     started_at: str | None = None
 
+
 class RenderLogRow(BaseModel):
-    ts: str | None = None
+    ts: str | None = None            # display timestamp (we emit Eastern)
     level: str | None = None
-    message: str
-    raw: dict | str | None = None
+    msg: str | None = None
+    raw: str                         # required by portal UI
+
 
 class RenderLogsOut(BaseModel):
+    service_id: str
+    instance_id: str | None = None
+    start_ms: int
+    end_ms: int
     rows: List[RenderLogRow]
     has_more: bool = False
     next_start_ms: int | None = None
@@ -396,32 +404,27 @@ class RenderLogsOut(BaseModel):
 
 
 def _render_owner_id() -> str | None:
-    # Optional: if set, we filter list-services and constrain log queries
     return (os.getenv("RENDER_OWNER_ID") or "").strip() or None
 
 
-def _normalize_log_row(item) -> RenderLogRow:
-    # Render logs typically return dict objects; keep robust.
-    if isinstance(item, str):
-        msg = item.strip()
-        return RenderLogRow(message=msg, raw=item)
-
-    if not isinstance(item, dict):
-        return RenderLogRow(message=str(item), raw={"value": str(item)})
-
-    ts = item.get("timestamp") or item.get("time") or item.get("ts")
-    msg = item.get("message") or item.get("text") or item.get("line") or json.dumps(item, ensure_ascii=False)
-    level = item.get("level") or item.get("severity")
-
-    # If level missing, attempt quick inference from message prefix.
-    if not level and isinstance(msg, str):
-        m = re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG|CRITICAL)\b", msg)
-        if m:
-            level = m.group(1)
-
-    return RenderLogRow(ts=ts, level=level, message=str(msg), raw=item)
+def _iso_to_est(iso_ts: str) -> str:
+    try:
+        dtu = dt.datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        local = dtu.astimezone(NY_TZ)
+        return local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return iso_ts
 
 
+def _extract_level_from_labels(labels: Any) -> str | None:
+    # Render provides labels like [{name:"level", value:"INFO"}, ...]
+    if not isinstance(labels, list):
+        return None
+    for lab in labels:
+        if isinstance(lab, dict) and str(lab.get("name", "")).lower() == "level":
+            v = lab.get("value")
+            return str(v) if v is not None else None
+    return None
 
 
 @app.get(
@@ -429,23 +432,14 @@ def _normalize_log_row(item) -> RenderLogRow:
     response_model=List[RenderServiceOut],
     dependencies=[Depends(require_admin_key)],
 )
-def admin_render_list_services(
-    limit: int = Query(default=100, ge=1, le=200),
-):
-    """
-    Lists Render services using the Render API key.
-
-    NOTE: Render list endpoints use cursor pagination.
-    - Default limit: 20
-    - Max limit: 100
-    """
-    # Clamp to Render's documented max
+def admin_render_list_services(limit: int = Query(default=100, ge=1, le=200)):
+    # Render max limit is 100; clamp any UI requests above that.
     if limit > 100:
         if DEBUG_RENDER_LOGS:
-            logger.info("RENDER_LIST_SERVICES clamp_limit requested=%s clamped=%s", limit, 100)
+            logger.info("RENDER_LIST_SERVICES clamp_limit requested=%s clamped=100", limit)
         limit = 100
 
-    def _parse_services(data) -> List[RenderServiceOut]:
+    def _parse_services(data: Any) -> List[RenderServiceOut]:
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
@@ -472,7 +466,7 @@ def admin_render_list_services(
             )
         return out
 
-    params = {"limit": str(limit)}
+    params: dict[str, Any] = {"limit": str(limit)}
     owner_id = (_render_owner_id() or "").strip()
     if owner_id:
         params["ownerId"] = owner_id
@@ -480,7 +474,6 @@ def admin_render_list_services(
     try:
         data = render_get_json("/v1/services", params=params)
         return _parse_services(data)
-
     except RenderAPIError as e:
         logger.error(
             "RENDER_LIST_SERVICES upstream_error status=%s owner_id=%s body=%s",
@@ -488,38 +481,22 @@ def admin_render_list_services(
             owner_id or None,
             getattr(e, "body", None),
         )
-
-        # Fail-soft: if ownerId likely caused a 400, retry once without it
+        # If ownerId filter is misconfigured, retry once without it.
         if owner_id and getattr(e, "status", None) == 400:
-            try:
-                logger.warning("RENDER_LIST_SERVICES retry_without_ownerId owner_id=%s", owner_id)
-                data2 = render_get_json("/v1/services", params={"limit": str(limit)})
-                return _parse_services(data2)
-            except RenderAPIError as e2:
-                logger.error(
-                    "RENDER_LIST_SERVICES retry_failed status=%s body=%s",
-                    getattr(e2, "status", None),
-                    getattr(e2, "body", None),
-                )
-                raise HTTPException(status_code=getattr(e2, "status", 502), detail=getattr(e2, "body", "upstream_error"))
-            except Exception as ex2:
-                logger.exception("RENDER_LIST_SERVICES retry_exception")
-                raise HTTPException(status_code=500, detail=str(ex2))
-
+            data2 = render_get_json("/v1/services", params={"limit": str(limit)})
+            return _parse_services(data2)
         raise HTTPException(status_code=getattr(e, "status", 502), detail=getattr(e, "body", "upstream_error"))
-
     except Exception as ex:
         logger.exception("RENDER_LIST_SERVICES exception")
         raise HTTPException(status_code=500, detail=str(ex))
 
 
-
-
-@app.get("/admin/render/services/{service_id}/instances", response_model=List[RenderInstanceOut], dependencies=[Depends(require_admin_key)])
+@app.get(
+    "/admin/render/services/{service_id}/instances",
+    response_model=List[RenderInstanceOut],
+    dependencies=[Depends(require_admin_key)],
+)
 def admin_render_list_instances(service_id: str):
-    """
-    Lists instances for a given Render service.
-    """
     try:
         data = render_get_json(f"/v1/services/{service_id}/instances", params={"limit": "50"})
     except RenderAPIError as e:
@@ -534,26 +511,19 @@ def admin_render_list_instances(service_id: str):
     for it in items:
         if not isinstance(it, dict):
             continue
+        iid = str(it.get("id") or "")
+        if not iid:
+            continue
         out.append(
             RenderInstanceOut(
-                id=str(it.get("id") or ""),
+                id=iid,
                 service_id=it.get("serviceId") or it.get("service_id") or service_id,
                 status=it.get("status"),
                 started_at=it.get("startedAt") or it.get("started_at"),
             )
         )
-    out = [x for x in out if x.id]
     return out
 
-
-def _iso_to_est(iso_ts: str) -> str:
-    # Render timestamps are RFC3339, often ending with Z
-    try:
-        dt = datetime.datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-        local = dt.astimezone(NY_TZ)
-        return local.strftime("%Y-%m-%d %H:%M:%S %Z")
-    except Exception:
-        return iso_ts  # fallback
 
 @app.get("/admin/render/logs", response_model=RenderLogsOut, dependencies=[Depends(require_admin_key)])
 def admin_render_logs(
@@ -563,25 +533,27 @@ def admin_render_logs(
     end_ms: int = Query(..., ge=0),
     q: str | None = Query(default=None),
     limit: int = Query(default=300, ge=1, le=2000),
-    next_start_ms: int | None = Query(default=None),
-    next_end_ms: int | None = Query(default=None),
 ):
+    """
+    Logs preview for Portal.
+
+    IMPORTANT:
+    - Do NOT pass `limit` to Render /v1/logs (timestamp pagination).
+    - Treat empty instance_id/q as None (portal sends empty strings).
+    - Always return 200 with rows:[] if no logs.
+    - Emit timestamps in America/New_York.
+    """
     if end_ms <= start_ms:
         raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
 
-    # Paging override
-    if next_start_ms is not None and next_end_ms is not None:
-        start_ms, end_ms = next_start_ms, next_end_ms
-
-    owner_id = (_render_owner_id() or "").strip()
+    owner_id = _render_owner_id()
     if not owner_id:
         raise HTTPException(status_code=500, detail="RENDER_OWNER_ID not configured")
 
-    # Treat empty strings as None (portal sometimes sends "")
     instance_id = (instance_id or "").strip() or None
     q = (q or "").strip() or None
 
-    params = {
+    params: dict[str, Any] = {
         "ownerId": owner_id,
         "startTime": ms_to_rfc3339(start_ms),
         "endTime": ms_to_rfc3339(end_ms),
@@ -591,23 +563,26 @@ def admin_render_logs(
     if instance_id:
         params["instance"] = [instance_id]
     if q:
-        # Render supports filtering via labels including "text" :contentReference[oaicite:1]{index=1}
         params["text"] = [q]
 
-    # Call Render
     try:
         data = render_get_json("/v1/logs", params=params)
     except RenderAPIError as e:
-        raise HTTPException(status_code=getattr(e, "status", 502), detail=getattr(e, "body", "upstream_error"))
+        # Fail-soft for preview: if Render is flaky, show empty rows instead of breaking UI.
+        body = getattr(e, "body", "") or ""
+        status = getattr(e, "status", 502)
+        if status >= 500:
+            if DEBUG_RENDER_LOGS:
+                logger.warning("RENDER_LOGS preview_failsoft status=%s body=%s", status, body)
+            return RenderLogsOut(service_id=service_id, instance_id=instance_id, start_ms=start_ms, end_ms=end_ms, rows=[])
+        raise HTTPException(status_code=status, detail=body or "upstream_error")
     except Exception as e:
-        # If Render returns empty/no-content and your client fails JSON decode, treat as empty
-        txt = str(e).lower()
-        if "json" in txt and "decode" in txt:
+        s = str(e).lower()
+        if "json" in s and "decode" in s:
             data = {}
         else:
             raise HTTPException(status_code=500, detail=str(e))
 
-    # Normalize response
     logs = []
     has_more = False
     next_start = None
@@ -619,28 +594,24 @@ def admin_render_logs(
         next_start = data.get("nextStartTime")
         next_end = data.get("nextEndTime")
 
-    # Map Render entries -> portal rows
-    rows = []
-    for e in logs[:limit]:
-        if not isinstance(e, dict):
+    rows: List[RenderLogRow] = []
+    for entry in (logs or [])[:limit]:
+        if not isinstance(entry, dict):
+            raw = str(entry)
+            rows.append(RenderLogRow(ts=None, level=None, msg=raw, raw=raw))
             continue
-        msg = e.get("message") or ""
-        ts_utc = e.get("timestamp") or ""
-        labels = e.get("labels") or []
-        label_map = {}
-        if isinstance(labels, list):
-            for lab in labels:
-                if isinstance(lab, dict) and lab.get("name") and lab.get("value") is not None:
-                    label_map[str(lab["name"])] = str(lab["value"])
+
+        msg = str(entry.get("message") or "")
+        ts_utc = str(entry.get("timestamp") or "")
+        lvl = _extract_level_from_labels(entry.get("labels"))
 
         rows.append(
-            {
-                "ts": _iso_to_est(ts_utc),          # ✅ Eastern display string
-                "level": label_map.get("level"),    # if present
-                "msg": msg,
-                "raw": msg,                         # portal uses raw fallback
-                "ts_utc": ts_utc,                   # optional, handy for debugging
-            }
+            RenderLogRow(
+                ts=_iso_to_est(ts_utc) if ts_utc else None,
+                level=lvl,
+                msg=msg or None,
+                raw=msg,
+            )
         )
 
     return RenderLogsOut(
@@ -662,29 +633,46 @@ def admin_render_logs_export(
     start_ms: int = Query(..., ge=0),
     end_ms: int = Query(..., ge=0),
     q: Optional[str] = Query(default=None),
+    format: str = Query(default="ndjson", description="ndjson|text"),
 ):
     """
-    Export logs as plain text (one line per record).
-    This does a bounded paged fetch using Render's hasMore + nextStartTime/nextEndTime.
+    Export logs.
+
+    - format=ndjson: JSON per line: {"ts":"...","level":"...","msg":"...","raw":"..."}
+    - format=text: plain text lines: "<ts> <level> <msg>"
+
+    We page using hasMore + nextStartTime/nextEndTime. We do NOT send `limit` upstream.
     """
     if end_ms <= start_ms:
         raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
 
-    filename = f"render_logs_{service_id}_{start_ms}_{end_ms}.log"
+    owner_id = _render_owner_id()
+    if not owner_id:
+        raise HTTPException(status_code=500, detail="RENDER_OWNER_ID not configured")
 
-    def _iter_text():
-        nonlocal start_ms, end_ms
-        params_base = {
-            "limit": "500",
-            "resource": service_id,
+    instance_id = (instance_id or "").strip() or None
+    q = (q or "").strip() or None
+    fmt = (format or "ndjson").strip().lower()
+    if fmt not in ("ndjson", "text"):
+        raise HTTPException(status_code=400, detail="format must be ndjson or text")
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", service_id)[:80]
+    filename = (
+        f"render-logs_{safe_name}_{int((end_ms-start_ms)/60000)}min_"
+        f"{datetime.utcnow().isoformat(timespec='seconds')}Z."
+        f"{'ndjson' if fmt == 'ndjson' else 'log'}"
+    )
+
+    def _iter_export() -> Iterator[bytes]:
+        params_base: dict[str, Any] = {
+            "ownerId": owner_id,
+            "direction": "backward",
+            "resource": [service_id],
         }
-        owner_id = _render_owner_id()
-        if owner_id:
-            params_base["ownerId"] = owner_id
         if instance_id:
-            params_base["instance"] = instance_id
+            params_base["instance"] = [instance_id]
         if q:
-            params_base["text"] = q
+            params_base["text"] = [q]
 
         cur_start = start_ms
         cur_end = end_ms
@@ -692,9 +680,12 @@ def admin_render_logs_export(
 
         while True:
             safety_pages += 1
-            if safety_pages > 20:
-                # hard cap to prevent runaway exports
-                yield "\n[export truncated: too many pages]\n"
+            if safety_pages > 30:
+                tail = {"ts": None, "level": "WARN", "msg": "[export truncated: too many pages]", "raw": "[export truncated]"}
+                if fmt == "ndjson":
+                    yield (json.dumps(tail) + "\n").encode("utf-8")
+                else:
+                    yield b"\n[export truncated: too many pages]\n"
                 break
 
             params = dict(params_base)
@@ -703,41 +694,63 @@ def admin_render_logs_export(
 
             try:
                 data = render_get_json("/v1/logs", params=params, timeout_s=30.0)
+            except RenderAPIError as e:
+                msg = f"[export error] Render API error {getattr(e,'status',None)}: {getattr(e,'body','')}"
+                if fmt == "ndjson":
+                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": msg, "raw": msg}) + "\n").encode("utf-8")
+                else:
+                    yield (msg + "\n").encode("utf-8")
+                break
             except Exception as e:
-                yield f"\n[export error] {e}\n"
+                msg = f"[export error] {e}"
+                if fmt == "ndjson":
+                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": msg, "raw": msg}) + "\n").encode("utf-8")
+                else:
+                    yield (msg + "\n").encode("utf-8")
                 break
 
             logs = []
             has_more = False
             next_start = None
             next_end = None
+
             if isinstance(data, dict):
-                logs = data.get("logs") or data.get("entries") or data.get("items") or []
-                has_more = bool(data.get("hasMore") or data.get("has_more") or False)
-                next_start = data.get("nextStartTime") or data.get("next_start_time")
-                next_end = data.get("nextEndTime") or data.get("next_end_time")
+                logs = data.get("logs") or []
+                has_more = bool(data.get("hasMore") or False)
+                next_start = data.get("nextStartTime")
+                next_end = data.get("nextEndTime")
             elif isinstance(data, list):
                 logs = data
 
-            for item in logs or []:
-                row = _normalize_log_row(item)
-                ts = row.ts or ""
-                lvl = row.level or ""
-                msg = row.message or ""
-                yield f"{ts} {lvl} {msg}\n"
+            for entry in logs or []:
+                if isinstance(entry, dict):
+                    msg = str(entry.get("message") or "")
+                    ts_utc = str(entry.get("timestamp") or "")
+                    lvl = _extract_level_from_labels(entry.get("labels"))
+                    ts_local = _iso_to_est(ts_utc) if ts_utc else None
+                    if fmt == "ndjson":
+                        yield (json.dumps({"ts": ts_local, "level": lvl, "msg": msg, "raw": msg}) + "\n").encode("utf-8")
+                    else:
+                        yield f"{ts_local or ''} {lvl or ''} {msg}\n".encode("utf-8")
+                else:
+                    raw = str(entry)
+                    if fmt == "ndjson":
+                        yield (json.dumps({"ts": None, "level": None, "msg": raw, "raw": raw}) + "\n").encode("utf-8")
+                    else:
+                        yield f"{raw}\n".encode("utf-8")
 
             if not has_more or not next_start or not next_end:
                 break
 
             ns = rfc3339_to_ms(next_start)
             ne = rfc3339_to_ms(next_end)
-            if not ns or not ne or ne <= ns:
+            if (not ns) or (not ne) or ne <= ns:
                 break
-
             cur_start, cur_end = ns, ne
 
+    media_type = "application/x-ndjson" if fmt == "ndjson" else "text/plain"
     return StreamingResponse(
-        _iter_text(),
-        media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        _iter_export(),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename=\"{filename}\""},
     )
