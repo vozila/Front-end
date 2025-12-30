@@ -388,7 +388,7 @@ def _normalize_log_row(item) -> RenderLogRow:
     return RenderLogRow(ts=ts, level=level, message=str(msg), raw=item)
 
 
-@@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
+@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
 def admin_render_list_services(
     limit: int = Query(default=100, ge=1, le=200),
 ):
