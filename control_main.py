@@ -1,10 +1,15 @@
 import os
 import json
 import re
+import logging
+import time
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
+logger = logging.getLogger("vozlia.control")
+DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
+
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -30,22 +35,21 @@ from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, R
 # AUTH
 # =========================
 
-from fastapi import Header, HTTPException
-
 def require_admin_key(
     x_vozlia_admin_key: str = Header(default="", alias="X-Vozlia-Admin-Key"),
     x_admin_key: str = Header(default="", alias="x-admin-key"),
+    x_vozlia_trace: str = Header(default="", alias="X-Vozlia-Trace"),
 ) -> bool:
     expected = (os.getenv("ADMIN_API_KEY", "") or "").strip()
     if not expected:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
 
     provided = (x_vozlia_admin_key or "").strip() or (x_admin_key or "").strip()
-    if not provided or provided != expected:
+    if (not provided) or (provided != expected):
+        if DEBUG_RENDER_LOGS:
+            logger.warning("ADMIN_AUTH_FAIL trace=%s", (x_vozlia_trace or "").strip() or None)
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     return True
-
 
 
 # =========================
@@ -53,6 +57,32 @@ def require_admin_key(
 # =========================
 
 app = FastAPI(title="Vozlia Control")
+
+
+@app.middleware("http")
+async def trace_middleware(request: Request, call_next):
+    trace = request.headers.get("x-vozlia-trace") or request.headers.get("X-Vozlia-Trace")
+    t0 = time.monotonic()
+    try:
+        resp = await call_next(request)
+    except Exception:
+        if DEBUG_RENDER_LOGS and request.url.path.startswith("/admin/render"):
+            logger.exception("RENDER_ADMIN_REQUEST_EXCEPTION trace=%s path=%s", trace, request.url.path)
+        raise
+    dt_ms = (time.monotonic() - t0) * 1000.0
+    if trace:
+        resp.headers["X-Vozlia-Trace"] = trace
+    if DEBUG_RENDER_LOGS and request.url.path.startswith("/admin/render"):
+        logger.info(
+            "RENDER_ADMIN %s %s status=%s ms=%.1f trace=%s",
+            request.method,
+            request.url.path,
+            getattr(resp, "status_code", None),
+            dt_ms,
+            trace,
+        )
+    return resp
+
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -408,40 +438,30 @@ def admin_render_list_services(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Render returns either:
-    #  - [ { "cursor": "...", "service": { ... } }, ... ]
-    #  - [ { ...service fields... }, ... ]
-    #  - { "services": [ ... ] }
+    out: List[RenderServiceOut] = []
     if isinstance(data, list):
         items = data
-    elif isinstance(data, dict):
-        items = data.get("services") or []
     else:
-        items = []
+        # Some APIs return { "services": [...] }
+        items = (data or {}).get("services") if isinstance(data, dict) else None
+        items = items or []
 
-    out: List[RenderServiceOut] = []
-    for it in items:
-        if not isinstance(it, dict):
+    for s in items:
+        if not isinstance(s, dict):
             continue
-
-        svc = it.get("service") if isinstance(it.get("service"), dict) else it
-
-        sid = str(svc.get("id") or "")
-        if not sid:
-            continue
-
         out.append(
             RenderServiceOut(
-                id=sid,
-                name=svc.get("name"),
-                type=svc.get("type"),
-                owner_id=svc.get("ownerId") or svc.get("owner_id"),
-                region=svc.get("region"),
+                id=str(s.get("id") or ""),
+                name=s.get("name"),
+                type=s.get("type"),
+                owner_id=s.get("ownerId") or s.get("owner_id"),
+                region=s.get("region"),
             )
         )
 
+    # remove empties
+    out = [x for x in out if x.id]
     return out
-
 
 
 @app.get("/admin/render/services/{service_id}/instances", response_model=List[RenderInstanceOut], dependencies=[Depends(require_admin_key)])
