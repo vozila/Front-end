@@ -617,7 +617,7 @@ def admin_render_logs(
         logs = logs[:limit]
 
     return RenderLogsOut(
-        logs=logs,
+        rows=logs,  # <-- IMPORTANT: model expects "rows"
         has_more=has_more,
         next_start_ms=rfc3339_to_ms(next_start) if next_start else None,
         next_end_ms=rfc3339_to_ms(next_end) if next_end else None,
