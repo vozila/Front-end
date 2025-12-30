@@ -752,5 +752,5 @@ def admin_render_logs_export(
     return StreamingResponse(
         _iter_export(),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename=\"{filename}\""},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
