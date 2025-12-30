@@ -30,13 +30,22 @@ from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, R
 # AUTH
 # =========================
 
-def require_admin_key(x_vozlia_admin_key: str = Header(default="", alias="X-Vozlia-Admin-Key")) -> bool:
-    expected = os.getenv("ADMIN_API_KEY", "")
+from fastapi import Header, HTTPException
+
+def require_admin_key(
+    x_vozlia_admin_key: str = Header(default="", alias="X-Vozlia-Admin-Key"),
+    x_admin_key: str = Header(default="", alias="x-admin-key"),
+) -> bool:
+    expected = (os.getenv("ADMIN_API_KEY", "") or "").strip()
     if not expected:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
-    if not x_vozlia_admin_key or x_vozlia_admin_key != expected:
+
+    provided = (x_vozlia_admin_key or "").strip() or (x_admin_key or "").strip()
+    if not provided or provided != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     return True
+
 
 
 # =========================
@@ -379,7 +388,7 @@ def _normalize_log_row(item) -> RenderLogRow:
     return RenderLogRow(ts=ts, level=level, message=str(msg), raw=item)
 
 
-@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
+@@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
 def admin_render_list_services(
     limit: int = Query(default=100, ge=1, le=200),
 ):
@@ -399,30 +408,40 @@ def admin_render_list_services(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    out: List[RenderServiceOut] = []
+    # Render returns either:
+    #  - [ { "cursor": "...", "service": { ... } }, ... ]
+    #  - [ { ...service fields... }, ... ]
+    #  - { "services": [ ... ] }
     if isinstance(data, list):
         items = data
+    elif isinstance(data, dict):
+        items = data.get("services") or []
     else:
-        # Some APIs return { "services": [...] }
-        items = (data or {}).get("services") if isinstance(data, dict) else None
-        items = items or []
+        items = []
 
-    for s in items:
-        if not isinstance(s, dict):
+    out: List[RenderServiceOut] = []
+    for it in items:
+        if not isinstance(it, dict):
             continue
+
+        svc = it.get("service") if isinstance(it.get("service"), dict) else it
+
+        sid = str(svc.get("id") or "")
+        if not sid:
+            continue
+
         out.append(
             RenderServiceOut(
-                id=str(s.get("id") or ""),
-                name=s.get("name"),
-                type=s.get("type"),
-                owner_id=s.get("ownerId") or s.get("owner_id"),
-                region=s.get("region"),
+                id=sid,
+                name=svc.get("name"),
+                type=svc.get("type"),
+                owner_id=svc.get("ownerId") or svc.get("owner_id"),
+                region=svc.get("region"),
             )
         )
 
-    # remove empties
-    out = [x for x in out if x.id]
     return out
+
 
 
 @app.get("/admin/render/services/{service_id}/instances", response_model=List[RenderInstanceOut], dependencies=[Depends(require_admin_key)])
