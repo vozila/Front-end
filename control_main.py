@@ -638,10 +638,12 @@ def admin_render_logs_export(
     """
     Export logs.
 
-    - format=ndjson: JSON per line: {"ts":"...","level":"...","msg":"...","raw":"..."}
+    - format=csv: CSV with columns: ts, level, msg, raw
     - format=text: plain text lines: "<ts> <level> <msg>"
+    - format=ndjson: JSON per line: {"ts":"...","level":"...","msg":"...","raw":"..."}
 
-    We page using hasMore + nextStartTime/nextEndTime. We do NOT send `limit` upstream.
+    We page using Render's hasMore + nextStartTime/nextEndTime.
+    We do NOT send `limit` upstream (Render /v1/logs is timestamp-paginated).
     """
     if end_ms <= start_ms:
         raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
@@ -663,19 +665,17 @@ def admin_render_logs_export(
         f"{'csv' if fmt == 'csv' else ('ndjson' if fmt == 'ndjson' else 'log')}"
     )
 
+    def _csv_escape(v: Any) -> str:
+        s = "" if v is None else str(v)
+        if any(c in s for c in [",", '"', "\n", "\r"]):
+            return '"' + s.replace('"', '""') + '"'
+        return s
+
     def _iter_export() -> Iterator[bytes]:
-
-        def _csv_escape(v: Any) -> str:
-            s = "" if v is None else str(v)
-            if any(c in s for c in [",", '"', "\n", "\r"]):
-                return '"' + s.replace('"', '""') + '"'
-            return s
-
-        
         if fmt == "csv":
             yield b"ts,level,msg,raw\n"
 
-params_base: dict[str, Any] = {
+        params_base: dict[str, Any] = {
             "ownerId": owner_id,
             "direction": "backward",
             "resource": [service_id],
@@ -692,11 +692,13 @@ params_base: dict[str, Any] = {
         while True:
             safety_pages += 1
             if safety_pages > 30:
-                tail = {"ts": None, "level": "WARN", "msg": "[export truncated: too many pages]", "raw": "[export truncated]"}
-                if fmt == "ndjson":
-                    yield (json.dumps(tail) + "\n").encode("utf-8")
+                msg = "[export truncated: too many pages]"
+                if fmt == "csv":
+                    yield (",".join([_csv_escape(None), _csv_escape("WARN"), _csv_escape(msg), _csv_escape(msg)]) + "\n").encode("utf-8")
+                elif fmt == "ndjson":
+                    yield (json.dumps({"ts": None, "level": "WARN", "msg": msg, "raw": msg}) + "\n").encode("utf-8")
                 else:
-                    yield b"\n[export truncated: too many pages]\n"
+                    yield (msg + "\n").encode("utf-8")
                 break
 
             params = dict(params_base)
@@ -706,18 +708,22 @@ params_base: dict[str, Any] = {
             try:
                 data = render_get_json("/v1/logs", params=params, timeout_s=30.0)
             except RenderAPIError as e:
-                msg = f"[export error] Render API error {getattr(e,'status',None)}: {getattr(e,'body','')}"
-                if fmt == "ndjson":
-                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": msg, "raw": msg}) + "\n").encode("utf-8")
+                err = f"[export error] Render API error {getattr(e, 'status', None)}: {getattr(e, 'body', '')}"
+                if fmt == "csv":
+                    yield (",".join([_csv_escape(None), _csv_escape("ERROR"), _csv_escape(err), _csv_escape(err)]) + "\n").encode("utf-8")
+                elif fmt == "ndjson":
+                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": err, "raw": err}) + "\n").encode("utf-8")
                 else:
-                    yield (msg + "\n").encode("utf-8")
+                    yield (err + "\n").encode("utf-8")
                 break
             except Exception as e:
-                msg = f"[export error] {e}"
-                if fmt == "ndjson":
-                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": msg, "raw": msg}) + "\n").encode("utf-8")
+                err = f"[export error] {e}"
+                if fmt == "csv":
+                    yield (",".join([_csv_escape(None), _csv_escape("ERROR"), _csv_escape(err), _csv_escape(err)]) + "\n").encode("utf-8")
+                elif fmt == "ndjson":
+                    yield (json.dumps({"ts": None, "level": "ERROR", "msg": err, "raw": err}) + "\n").encode("utf-8")
                 else:
-                    yield (msg + "\n").encode("utf-8")
+                    yield (err + "\n").encode("utf-8")
                 break
 
             logs = []
@@ -739,13 +745,9 @@ params_base: dict[str, Any] = {
                     ts_utc = str(entry.get("timestamp") or "")
                     lvl = _extract_level_from_labels(entry.get("labels"))
                     ts_local = _iso_to_est(ts_utc) if ts_utc else None
+
                     if fmt == "csv":
-                        line = ",".join([
-                            _csv_escape(ts_local),
-                            _csv_escape(lvl),
-                            _csv_escape(msg),
-                            _csv_escape(msg),
-                        ]) + "\n"
+                        line = ",".join([_csv_escape(ts_local), _csv_escape(lvl), _csv_escape(msg), _csv_escape(msg)]) + "\n"
                         yield line.encode("utf-8")
                     elif fmt == "ndjson":
                         yield (json.dumps({"ts": ts_local, "level": lvl, "msg": msg, "raw": msg}) + "\n").encode("utf-8")
@@ -754,12 +756,7 @@ params_base: dict[str, Any] = {
                 else:
                     raw = str(entry)
                     if fmt == "csv":
-                        line = ",".join([
-                            _csv_escape(None),
-                            _csv_escape(None),
-                            _csv_escape(raw),
-                            _csv_escape(raw),
-                        ]) + "\n"
+                        line = ",".join([_csv_escape(None), _csv_escape(None), _csv_escape(raw), _csv_escape(raw)]) + "\n"
                         yield line.encode("utf-8")
                     elif fmt == "ndjson":
                         yield (json.dumps({"ts": None, "level": None, "msg": raw, "raw": raw}) + "\n").encode("utf-8")
@@ -781,3 +778,4 @@ params_base: dict[str, Any] = {
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
