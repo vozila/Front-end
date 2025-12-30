@@ -633,7 +633,7 @@ def admin_render_logs_export(
     start_ms: int = Query(..., ge=0),
     end_ms: int = Query(..., ge=0),
     q: Optional[str] = Query(default=None),
-    format: str = Query(default="ndjson", description="ndjson|text"),
+    format: str = Query(default="csv", description="csv|text|ndjson"),
 ):
     """
     Export logs.
@@ -652,19 +652,30 @@ def admin_render_logs_export(
 
     instance_id = (instance_id or "").strip() or None
     q = (q or "").strip() or None
-    fmt = (format or "ndjson").strip().lower()
-    if fmt not in ("ndjson", "text"):
-        raise HTTPException(status_code=400, detail="format must be ndjson or text")
+    fmt = (format or "csv").strip().lower()
+    if fmt not in ("csv", "text", "ndjson"):
+        raise HTTPException(status_code=400, detail="format must be csv, text, or ndjson")
 
     safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", service_id)[:80]
     filename = (
         f"render-logs_{safe_name}_{int((end_ms-start_ms)/60000)}min_"
         f"{datetime.utcnow().isoformat(timespec='seconds')}Z."
-        f"{'ndjson' if fmt == 'ndjson' else 'log'}"
+        f"{'csv' if fmt == 'csv' else ('ndjson' if fmt == 'ndjson' else 'log')}"
     )
 
     def _iter_export() -> Iterator[bytes]:
-        params_base: dict[str, Any] = {
+
+        def _csv_escape(v: Any) -> str:
+            s = "" if v is None else str(v)
+            if any(c in s for c in [",", '"', "\n", "\r"]):
+                return '"' + s.replace('"', '""') + '"'
+            return s
+
+        
+        if fmt == "csv":
+            yield b"ts,level,msg,raw\n"
+
+params_base: dict[str, Any] = {
             "ownerId": owner_id,
             "direction": "backward",
             "resource": [service_id],
@@ -728,13 +739,29 @@ def admin_render_logs_export(
                     ts_utc = str(entry.get("timestamp") or "")
                     lvl = _extract_level_from_labels(entry.get("labels"))
                     ts_local = _iso_to_est(ts_utc) if ts_utc else None
-                    if fmt == "ndjson":
+                    if fmt == "csv":
+                        line = ",".join([
+                            _csv_escape(ts_local),
+                            _csv_escape(lvl),
+                            _csv_escape(msg),
+                            _csv_escape(msg),
+                        ]) + "\n"
+                        yield line.encode("utf-8")
+                    elif fmt == "ndjson":
                         yield (json.dumps({"ts": ts_local, "level": lvl, "msg": msg, "raw": msg}) + "\n").encode("utf-8")
                     else:
                         yield f"{ts_local or ''} {lvl or ''} {msg}\n".encode("utf-8")
                 else:
                     raw = str(entry)
-                    if fmt == "ndjson":
+                    if fmt == "csv":
+                        line = ",".join([
+                            _csv_escape(None),
+                            _csv_escape(None),
+                            _csv_escape(raw),
+                            _csv_escape(raw),
+                        ]) + "\n"
+                        yield line.encode("utf-8")
+                    elif fmt == "ndjson":
                         yield (json.dumps({"ts": None, "level": None, "msg": raw, "raw": raw}) + "\n").encode("utf-8")
                     else:
                         yield f"{raw}\n".encode("utf-8")
@@ -748,7 +775,7 @@ def admin_render_logs_export(
                 break
             cur_start, cur_end = ns, ne
 
-    media_type = "application/x-ndjson" if fmt == "ndjson" else "text/plain"
+    media_type = "text/csv" if fmt == "csv" else ("application/x-ndjson" if fmt == "ndjson" else "text/plain")
     return StreamingResponse(
         _iter_export(),
         media_type=media_type,
