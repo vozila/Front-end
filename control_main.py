@@ -5,6 +5,8 @@ import logging
 import time
 from datetime import datetime, timedelta
 from typing import List, Optional
+from fastapi import HTTPException, Query, Depends
+from typing import List
 
 logger = logging.getLogger("vozlia.control")
 DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
@@ -418,50 +420,92 @@ def _normalize_log_row(item) -> RenderLogRow:
     return RenderLogRow(ts=ts, level=level, message=str(msg), raw=item)
 
 
-@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
+
+
+@app.get(
+    "/admin/render/services",
+    response_model=List[RenderServiceOut],
+    dependencies=[Depends(require_admin_key)],
+)
 def admin_render_list_services(
     limit: int = Query(default=100, ge=1, le=200),
 ):
     """
-    Lists Render services for the configured Render API key.
-    Optionally filtered to RENDER_OWNER_ID if configured.
+    Lists Render services using the Render API key.
+
+    IMPORTANT:
+    - Render /v1/services can return items shaped as {cursor, service:{...}}
+    - If RENDER_OWNER_ID is configured and causes a 400 upstream, we retry once without it.
     """
+    def _parse_services(data) -> List[RenderServiceOut]:
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("services") or []
+        else:
+            items = []
+
+        out: List[RenderServiceOut] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            svc = it.get("service") if isinstance(it.get("service"), dict) else it
+            sid = str(svc.get("id") or "")
+            if not sid:
+                continue
+            out.append(
+                RenderServiceOut(
+                    id=sid,
+                    name=svc.get("name"),
+                    type=svc.get("type"),
+                    owner_id=svc.get("ownerId") or svc.get("owner_id"),
+                    region=svc.get("region"),
+                )
+            )
+        return out
+
     params = {"limit": str(limit)}
-    owner_id = _render_owner_id()
+    owner_id = (_render_owner_id() or "").strip()
     if owner_id:
         params["ownerId"] = owner_id
 
     try:
         data = render_get_json("/v1/services", params=params)
+        return _parse_services(data)
+
     except RenderAPIError as e:
-        raise HTTPException(status_code=e.status, detail=e.body)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    out: List[RenderServiceOut] = []
-    if isinstance(data, list):
-        items = data
-    else:
-        # Some APIs return { "services": [...] }
-        items = (data or {}).get("services") if isinstance(data, dict) else None
-        items = items or []
-
-    for s in items:
-        if not isinstance(s, dict):
-            continue
-        out.append(
-            RenderServiceOut(
-                id=str(s.get("id") or ""),
-                name=s.get("name"),
-                type=s.get("type"),
-                owner_id=s.get("ownerId") or s.get("owner_id"),
-                region=s.get("region"),
-            )
+        # Add concrete logging for diagnosis
+        logger.error(
+            "RENDER_LIST_SERVICES upstream_error status=%s owner_id=%s body=%s",
+            getattr(e, "status", None),
+            owner_id or None,
+            getattr(e, "body", None),
         )
 
-    # remove empties
-    out = [x for x in out if x.id]
-    return out
+        # Fail-soft: if ownerId likely caused a 400, retry once without it
+        if owner_id and getattr(e, "status", None) == 400:
+            try:
+                logger.warning("RENDER_LIST_SERVICES retry_without_ownerId owner_id=%s", owner_id)
+                params.pop("ownerId", None)
+                data2 = render_get_json("/v1/services", params=params)
+                return _parse_services(data2)
+            except RenderAPIError as e2:
+                logger.error(
+                    "RENDER_LIST_SERVICES retry_failed status=%s body=%s",
+                    getattr(e2, "status", None),
+                    getattr(e2, "body", None),
+                )
+                raise HTTPException(status_code=getattr(e2, "status", 502), detail=getattr(e2, "body", "upstream_error"))
+            except Exception as ex2:
+                logger.exception("RENDER_LIST_SERVICES retry_exception")
+                raise HTTPException(status_code=500, detail=str(ex2))
+
+        raise HTTPException(status_code=getattr(e, "status", 502), detail=getattr(e, "body", "upstream_error"))
+
+    except Exception as ex:
+        logger.exception("RENDER_LIST_SERVICES exception")
+        raise HTTPException(status_code=500, detail=str(ex))
+
 
 
 @app.get("/admin/render/services/{service_id}/instances", response_model=List[RenderInstanceOut], dependencies=[Depends(require_admin_key)])
