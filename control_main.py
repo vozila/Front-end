@@ -16,6 +16,8 @@ import re
 import logging
 import time
 import random
+import urllib.error
+import socket
 import datetime as dt
 from datetime import datetime, timedelta
 from typing import List, Optional, Iterator, Any
@@ -436,10 +438,9 @@ def _render_get_json_with_backoff(
     max_retries: int = 5,
     base_sleep_s: float = 0.6,
 ):
-    """Call Render API with exponential backoff on 429/5xx.
+    """Call Render API with exponential backoff on 429/5xx and transient network errors.
 
-    This prevents the Portal "Load all" / export loops from immediately failing when
-    Render rate-limits. Retries are bounded and add jitter to avoid thundering herds.
+    Retries are bounded and add jitter to avoid thundering herds.
     """
     attempt = 0
     while True:
@@ -447,6 +448,7 @@ def _render_get_json_with_backoff(
             if timeout_s is None:
                 return render_get_json(path, params=params)
             return render_get_json(path, params=params, timeout_s=timeout_s)
+
         except RenderAPIError as e:
             status = getattr(e, "status", None)
             body = getattr(e, "body", None)
@@ -454,7 +456,6 @@ def _render_get_json_with_backoff(
             if (not retryable) or attempt >= max_retries:
                 raise
 
-            # exponential backoff + jitter
             sleep_s = base_sleep_s * (2**attempt) + random.uniform(0.0, 0.25)
             if DEBUG_RENDER_LOGS:
                 logger.warning(
@@ -468,7 +469,21 @@ def _render_get_json_with_backoff(
             attempt += 1
             continue
 
-
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
+            # Treat transient transport errors as retryable (common under upstream throttling).
+            if attempt >= max_retries:
+                raise
+            sleep_s = base_sleep_s * (2**attempt) + random.uniform(0.0, 0.25)
+            if DEBUG_RENDER_LOGS:
+                logger.warning(
+                    "RENDER_BACKOFF transport_error attempt=%s sleep_s=%.2f err=%s",
+                    attempt + 1,
+                    sleep_s,
+                    str(e),
+                )
+            time.sleep(sleep_s)
+            attempt += 1
+            continue
 @app.get(
     "/admin/render/services",
     response_model=List[RenderServiceOut],
@@ -613,17 +628,37 @@ def admin_render_logs(
         # Fail-soft for preview: if Render is flaky, show empty rows instead of breaking UI.
         body = getattr(e, "body", "") or ""
         status = getattr(e, "status", 502)
+        # Fail-soft on rate limit for preview so the table still renders.
+        if status == 429:
+            msg = "Render rate limit exceeded. Please wait a few seconds and try again."
+            if DEBUG_RENDER_LOGS:
+                logger.warning("RENDER_LOGS preview_rate_limited status=429 body=%s", body)
+            return RenderLogsOut(
+                service_id=service_id,
+                instance_id=instance_id,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                rows=[RenderLogRow(ts=None, level="ERROR", msg=msg, raw=msg)],
+                has_more=False,
+            )
         if status >= 500:
             if DEBUG_RENDER_LOGS:
                 logger.warning("RENDER_LOGS preview_failsoft status=%s body=%s", status, body)
             return RenderLogsOut(service_id=service_id, instance_id=instance_id, start_ms=start_ms, end_ms=end_ms, rows=[])
         raise HTTPException(status_code=status, detail=body or "upstream_error")
     except Exception as e:
-        s = str(e).lower()
-        if "json" in s and "decode" in s:
-            data = {}
-        else:
-            raise HTTPException(status_code=500, detail=str(e))
+        # Fail-soft for preview: keep UI functional even if Render/network is flaky.
+        msg = f"Render logs preview error: {e}"
+        if DEBUG_RENDER_LOGS:
+            logger.exception("RENDER_LOGS preview_exception")
+        return RenderLogsOut(
+            service_id=service_id,
+            instance_id=instance_id,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            rows=[RenderLogRow(ts=None, level="ERROR", msg=msg, raw=msg)],
+            has_more=False,
+        )
 
     logs = []
     has_more = False
@@ -666,7 +701,6 @@ def admin_render_logs(
         next_start_ms=rfc3339_to_ms(next_start) if next_start else None,
         next_end_ms=rfc3339_to_ms(next_end) if next_end else None,
     )
-
 
 @app.get("/admin/render/logs/export", dependencies=[Depends(require_admin_key)])
 def admin_render_logs_export(
@@ -820,4 +854,3 @@ def admin_render_logs_export(
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
