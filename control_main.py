@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from fastapi import HTTPException, Query, Depends
 from typing import List
+from zoneinfo import ZoneInfo
+import datetime
 
 logger = logging.getLogger("vozlia.control")
 DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
@@ -544,42 +546,41 @@ def admin_render_list_instances(service_id: str):
     return out
 
 
+def _iso_to_est(iso_ts: str) -> str:
+    # Render timestamps are RFC3339, often ending with Z
+    try:
+        dt = datetime.datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        local = dt.astimezone(NY_TZ)
+        return local.strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return iso_ts  # fallback
+
 @app.get("/admin/render/logs", response_model=RenderLogsOut, dependencies=[Depends(require_admin_key)])
 def admin_render_logs(
-    service_id: str = Query(..., description="Render service id (srv-...)"),
-    instance_id: Optional[str] = Query(default=None, description="Render instance id (optional)"),
+    service_id: str = Query(...),
+    instance_id: str | None = Query(default=None),
     start_ms: int = Query(..., ge=0),
     end_ms: int = Query(..., ge=0),
-    q: Optional[str] = Query(default=None, description="Optional text filter"),
+    q: str | None = Query(default=None),
     limit: int = Query(default=300, ge=1, le=2000),
-    next_start_ms: Optional[int] = Query(default=None),
-    next_end_ms: Optional[int] = Query(default=None),
+    next_start_ms: int | None = Query(default=None),
+    next_end_ms: int | None = Query(default=None),
 ):
-    """
-    Preview logs for a service (and optional instance) between start_ms and end_ms.
-
-    IMPORTANT:
-    - Render GET /v1/logs does NOT accept `limit` (timestamp pagination instead).
-    - Render requires `ownerId` + `resource` filters.
-    We slice locally to `limit`.
-    """
     if end_ms <= start_ms:
         raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
 
-    # If paging values are provided, they replace the requested window.
+    # Paging override
     if next_start_ms is not None and next_end_ms is not None:
-        start_ms = next_start_ms
-        end_ms = next_end_ms
+        start_ms, end_ms = next_start_ms, next_end_ms
 
     owner_id = (_render_owner_id() or "").strip()
     if not owner_id:
-        # Make this loud: Render /v1/logs requires ownerId
-        raise HTTPException(
-            status_code=500,
-            detail="RENDER_OWNER_ID (workspace id, e.g. tea-...) is not configured on the control-plane service",
-        )
+        raise HTTPException(status_code=500, detail="RENDER_OWNER_ID not configured")
 
-    # Build Render query params (arrays are OK; urlencode(doseq=True) will repeat keys)
+    # Treat empty strings as None (portal sometimes sends "")
+    instance_id = (instance_id or "").strip() or None
+    q = (q or "").strip() or None
+
     params = {
         "ownerId": owner_id,
         "startTime": ms_to_rfc3339(start_ms),
@@ -587,37 +588,67 @@ def admin_render_logs(
         "direction": "backward",
         "resource": [service_id],
     }
-
     if instance_id:
         params["instance"] = [instance_id]
-
     if q:
-        # Render supports filtering via queryable labels (commonly "text")
+        # Render supports filtering via labels including "text" :contentReference[oaicite:1]{index=1}
         params["text"] = [q]
 
+    # Call Render
     try:
         data = render_get_json("/v1/logs", params=params)
     except RenderAPIError as e:
-        raise HTTPException(status_code=e.status, detail=e.body)
+        raise HTTPException(status_code=getattr(e, "status", 502), detail=getattr(e, "body", "upstream_error"))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # If Render returns empty/no-content and your client fails JSON decode, treat as empty
+        txt = str(e).lower()
+        if "json" in txt and "decode" in txt:
+            data = {}
+        else:
+            raise HTTPException(status_code=500, detail=str(e))
 
+    # Normalize response
     logs = []
     has_more = False
     next_start = None
     next_end = None
 
     if isinstance(data, dict):
-        logs = data.get("logs") or data.get("entries") or data.get("items") or []
-        has_more = bool(data.get("hasMore") or data.get("has_more") or False)
-        next_start = data.get("nextStartTime") or data.get("next_start_time")
-        next_end = data.get("nextEndTime") or data.get("next_end_time")
+        logs = data.get("logs") or []
+        has_more = bool(data.get("hasMore") or False)
+        next_start = data.get("nextStartTime")
+        next_end = data.get("nextEndTime")
 
-    if isinstance(logs, list) and len(logs) > limit:
-        logs = logs[:limit]
+    # Map Render entries -> portal rows
+    rows = []
+    for e in logs[:limit]:
+        if not isinstance(e, dict):
+            continue
+        msg = e.get("message") or ""
+        ts_utc = e.get("timestamp") or ""
+        labels = e.get("labels") or []
+        label_map = {}
+        if isinstance(labels, list):
+            for lab in labels:
+                if isinstance(lab, dict) and lab.get("name") and lab.get("value") is not None:
+                    label_map[str(lab["name"])] = str(lab["value"])
+
+        rows.append(
+            {
+                "ts": _iso_to_est(ts_utc),          # ✅ Eastern display string
+                "level": label_map.get("level"),    # if present
+                "msg": msg,
+                "raw": msg,                         # portal uses raw fallback
+                "ts_utc": ts_utc,                   # optional, handy for debugging
+            }
+        )
 
     return RenderLogsOut(
-        rows=logs,  # <-- IMPORTANT: model expects "rows"
+        service_id=service_id,
+        instance_id=instance_id,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        rows=rows,
         has_more=has_more,
         next_start_ms=rfc3339_to_ms(next_start) if next_start else None,
         next_end_ms=rfc3339_to_ms(next_end) if next_end else None,
