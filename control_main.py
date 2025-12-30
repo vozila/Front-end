@@ -1,8 +1,11 @@
 import os
+import json
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -20,6 +23,8 @@ from services.settings_service import (
     set_setting,
     set_enabled_gmail_account_ids,
 )
+from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, RenderAPIError
+
 
 # =========================
 # AUTH
@@ -317,3 +322,301 @@ def delete_email_account(
     a.password_enc = None
     db.commit()
     return {"status": "disconnected", "hard": False}
+# =========================
+# RENDER LOGS (Portal helper)
+# =========================
+
+class RenderServiceOut(BaseModel):
+    id: str
+    name: str | None = None
+    type: str | None = None
+    owner_id: str | None = None
+    region: str | None = None
+
+class RenderInstanceOut(BaseModel):
+    id: str
+    service_id: str | None = None
+    status: str | None = None
+    started_at: str | None = None
+
+class RenderLogRow(BaseModel):
+    ts: str | None = None
+    level: str | None = None
+    message: str
+    raw: dict | str | None = None
+
+class RenderLogsOut(BaseModel):
+    rows: List[RenderLogRow]
+    has_more: bool = False
+    next_start_ms: int | None = None
+    next_end_ms: int | None = None
+
+
+def _render_owner_id() -> str | None:
+    # Optional: if set, we filter list-services and constrain log queries
+    return (os.getenv("RENDER_OWNER_ID") or "").strip() or None
+
+
+def _normalize_log_row(item) -> RenderLogRow:
+    # Render logs typically return dict objects; keep robust.
+    if isinstance(item, str):
+        msg = item.strip()
+        return RenderLogRow(message=msg, raw=item)
+
+    if not isinstance(item, dict):
+        return RenderLogRow(message=str(item), raw={"value": str(item)})
+
+    ts = item.get("timestamp") or item.get("time") or item.get("ts")
+    msg = item.get("message") or item.get("text") or item.get("line") or json.dumps(item, ensure_ascii=False)
+    level = item.get("level") or item.get("severity")
+
+    # If level missing, attempt quick inference from message prefix.
+    if not level and isinstance(msg, str):
+        m = re.search(r"\b(INFO|WARN|WARNING|ERROR|DEBUG|CRITICAL)\b", msg)
+        if m:
+            level = m.group(1)
+
+    return RenderLogRow(ts=ts, level=level, message=str(msg), raw=item)
+
+
+@app.get("/admin/render/services", response_model=List[RenderServiceOut], dependencies=[Depends(require_admin_key)])
+def admin_render_list_services(
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    """
+    Lists Render services for the configured Render API key.
+    Optionally filtered to RENDER_OWNER_ID if configured.
+    """
+    params = {"limit": str(limit)}
+    owner_id = _render_owner_id()
+    if owner_id:
+        params["ownerId"] = owner_id
+
+    try:
+        data = render_get_json("/v1/services", params=params)
+    except RenderAPIError as e:
+        raise HTTPException(status_code=e.status, detail=e.body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    out: List[RenderServiceOut] = []
+    if isinstance(data, list):
+        items = data
+    else:
+        # Some APIs return { "services": [...] }
+        items = (data or {}).get("services") if isinstance(data, dict) else None
+        items = items or []
+
+    for s in items:
+        if not isinstance(s, dict):
+            continue
+        out.append(
+            RenderServiceOut(
+                id=str(s.get("id") or ""),
+                name=s.get("name"),
+                type=s.get("type"),
+                owner_id=s.get("ownerId") or s.get("owner_id"),
+                region=s.get("region"),
+            )
+        )
+
+    # remove empties
+    out = [x for x in out if x.id]
+    return out
+
+
+@app.get("/admin/render/services/{service_id}/instances", response_model=List[RenderInstanceOut], dependencies=[Depends(require_admin_key)])
+def admin_render_list_instances(service_id: str):
+    """
+    Lists instances for a given Render service.
+    """
+    try:
+        data = render_get_json(f"/v1/services/{service_id}/instances", params={"limit": "50"})
+    except RenderAPIError as e:
+        raise HTTPException(status_code=e.status, detail=e.body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    items = data if isinstance(data, list) else ((data or {}).get("instances") if isinstance(data, dict) else [])
+    items = items or []
+
+    out: List[RenderInstanceOut] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        out.append(
+            RenderInstanceOut(
+                id=str(it.get("id") or ""),
+                service_id=it.get("serviceId") or it.get("service_id") or service_id,
+                status=it.get("status"),
+                started_at=it.get("startedAt") or it.get("started_at"),
+            )
+        )
+    out = [x for x in out if x.id]
+    return out
+
+
+@app.get("/admin/render/logs", response_model=RenderLogsOut, dependencies=[Depends(require_admin_key)])
+def admin_render_logs(
+    service_id: str = Query(..., description="Render service id (srv-...)"),
+    instance_id: Optional[str] = Query(default=None, description="Render instance id (optional)"),
+    start_ms: int = Query(..., ge=0),
+    end_ms: int = Query(..., ge=0),
+    q: Optional[str] = Query(default=None, description="Optional text filter"),
+    limit: int = Query(default=200, ge=1, le=500),
+    next_start_ms: Optional[int] = Query(default=None),
+    next_end_ms: Optional[int] = Query(default=None),
+):
+    """
+    Preview logs for a service (and optional instance) between start_ms and end_ms.
+    Supports paging via next_start_ms/next_end_ms (returned from previous response).
+    """
+    if end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
+
+    # For paging, override start/end with next values if provided
+    if next_start_ms and next_end_ms and next_end_ms > next_start_ms:
+        start_ms = next_start_ms
+        end_ms = next_end_ms
+
+    params = {
+        "limit": str(limit),
+        "startTime": ms_to_rfc3339(start_ms),
+        "endTime": ms_to_rfc3339(end_ms),
+        # Render expects resource filters; use single service id.
+        "resource": service_id,
+    }
+
+    owner_id = _render_owner_id()
+    if owner_id:
+        params["ownerId"] = owner_id
+
+    if instance_id:
+        params["instance"] = instance_id
+
+    # Some Render API implementations support server-side text query; keep as best-effort.
+    if q:
+        params["text"] = q
+
+    try:
+        data = render_get_json("/v1/logs", params=params)
+    except RenderAPIError as e:
+        raise HTTPException(status_code=e.status, detail=e.body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logs = []
+    has_more = False
+    next_start = None
+    next_end = None
+
+    if isinstance(data, dict):
+        logs = data.get("logs") or data.get("entries") or data.get("items") or []
+        has_more = bool(data.get("hasMore") or data.get("has_more") or False)
+        next_start = data.get("nextStartTime") or data.get("next_start_time")
+        next_end = data.get("nextEndTime") or data.get("next_end_time")
+    elif isinstance(data, list):
+        logs = data
+
+    rows = [_normalize_log_row(x) for x in (logs or [])]
+
+    # If server-side filtering isn't supported, apply client-side filter.
+    if q and rows:
+        qn = q.lower()
+        rows = [r for r in rows if qn in (r.message or "").lower()]
+
+    out = RenderLogsOut(
+        rows=rows,
+        has_more=has_more,
+        next_start_ms=rfc3339_to_ms(next_start) if next_start else None,
+        next_end_ms=rfc3339_to_ms(next_end) if next_end else None,
+    )
+    return out
+
+
+@app.get("/admin/render/logs/export", dependencies=[Depends(require_admin_key)])
+def admin_render_logs_export(
+    service_id: str = Query(...),
+    instance_id: Optional[str] = Query(default=None),
+    start_ms: int = Query(..., ge=0),
+    end_ms: int = Query(..., ge=0),
+    q: Optional[str] = Query(default=None),
+):
+    """
+    Export logs as plain text (one line per record).
+    This does a bounded paged fetch using Render's hasMore + nextStartTime/nextEndTime.
+    """
+    if end_ms <= start_ms:
+        raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
+
+    filename = f"render_logs_{service_id}_{start_ms}_{end_ms}.log"
+
+    def _iter_text():
+        nonlocal start_ms, end_ms
+        params_base = {
+            "limit": "500",
+            "resource": service_id,
+        }
+        owner_id = _render_owner_id()
+        if owner_id:
+            params_base["ownerId"] = owner_id
+        if instance_id:
+            params_base["instance"] = instance_id
+        if q:
+            params_base["text"] = q
+
+        cur_start = start_ms
+        cur_end = end_ms
+        safety_pages = 0
+
+        while True:
+            safety_pages += 1
+            if safety_pages > 20:
+                # hard cap to prevent runaway exports
+                yield "\n[export truncated: too many pages]\n"
+                break
+
+            params = dict(params_base)
+            params["startTime"] = ms_to_rfc3339(cur_start)
+            params["endTime"] = ms_to_rfc3339(cur_end)
+
+            try:
+                data = render_get_json("/v1/logs", params=params, timeout_s=30.0)
+            except Exception as e:
+                yield f"\n[export error] {e}\n"
+                break
+
+            logs = []
+            has_more = False
+            next_start = None
+            next_end = None
+            if isinstance(data, dict):
+                logs = data.get("logs") or data.get("entries") or data.get("items") or []
+                has_more = bool(data.get("hasMore") or data.get("has_more") or False)
+                next_start = data.get("nextStartTime") or data.get("next_start_time")
+                next_end = data.get("nextEndTime") or data.get("next_end_time")
+            elif isinstance(data, list):
+                logs = data
+
+            for item in logs or []:
+                row = _normalize_log_row(item)
+                ts = row.ts or ""
+                lvl = row.level or ""
+                msg = row.message or ""
+                yield f"{ts} {lvl} {msg}\n"
+
+            if not has_more or not next_start or not next_end:
+                break
+
+            ns = rfc3339_to_ms(next_start)
+            ne = rfc3339_to_ms(next_end)
+            if not ns or not ne or ne <= ns:
+                break
+
+            cur_start, cur_end = ns, ne
+
+    return StreamingResponse(
+        _iter_text(),
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
