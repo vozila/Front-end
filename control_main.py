@@ -551,40 +551,49 @@ def admin_render_logs(
     start_ms: int = Query(..., ge=0),
     end_ms: int = Query(..., ge=0),
     q: Optional[str] = Query(default=None, description="Optional text filter"),
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=300, ge=1, le=2000),
     next_start_ms: Optional[int] = Query(default=None),
     next_end_ms: Optional[int] = Query(default=None),
 ):
     """
     Preview logs for a service (and optional instance) between start_ms and end_ms.
-    Supports paging via next_start_ms/next_end_ms (returned from previous response).
+
+    IMPORTANT:
+    - Render GET /v1/logs does NOT accept `limit` (timestamp pagination instead).
+    - Render requires `ownerId` + `resource` filters.
+    We slice locally to `limit`.
     """
     if end_ms <= start_ms:
         raise HTTPException(status_code=400, detail="end_ms must be > start_ms")
 
-    # For paging, override start/end with next values if provided
-    if next_start_ms and next_end_ms and next_end_ms > next_start_ms:
+    # If paging values are provided, they replace the requested window.
+    if next_start_ms is not None and next_end_ms is not None:
         start_ms = next_start_ms
         end_ms = next_end_ms
 
+    owner_id = (_render_owner_id() or "").strip()
+    if not owner_id:
+        # Make this loud: Render /v1/logs requires ownerId
+        raise HTTPException(
+            status_code=500,
+            detail="RENDER_OWNER_ID (workspace id, e.g. tea-...) is not configured on the control-plane service",
+        )
+
+    # Build Render query params (arrays are OK; urlencode(doseq=True) will repeat keys)
     params = {
-        "limit": str(limit),
+        "ownerId": owner_id,
         "startTime": ms_to_rfc3339(start_ms),
         "endTime": ms_to_rfc3339(end_ms),
-        # Render expects resource filters; use single service id.
-        "resource": service_id,
+        "direction": "backward",
+        "resource": [service_id],
     }
 
-    owner_id = _render_owner_id()
-    if owner_id:
-        params["ownerId"] = owner_id
-
     if instance_id:
-        params["instance"] = instance_id
+        params["instance"] = [instance_id]
 
-    # Some Render API implementations support server-side text query; keep as best-effort.
     if q:
-        params["text"] = q
+        # Render supports filtering via queryable labels (commonly "text")
+        params["text"] = [q]
 
     try:
         data = render_get_json("/v1/logs", params=params)
@@ -603,23 +612,16 @@ def admin_render_logs(
         has_more = bool(data.get("hasMore") or data.get("has_more") or False)
         next_start = data.get("nextStartTime") or data.get("next_start_time")
         next_end = data.get("nextEndTime") or data.get("next_end_time")
-    elif isinstance(data, list):
-        logs = data
 
-    rows = [_normalize_log_row(x) for x in (logs or [])]
+    if isinstance(logs, list) and len(logs) > limit:
+        logs = logs[:limit]
 
-    # If server-side filtering isn't supported, apply client-side filter.
-    if q and rows:
-        qn = q.lower()
-        rows = [r for r in rows if qn in (r.message or "").lower()]
-
-    out = RenderLogsOut(
-        rows=rows,
+    return RenderLogsOut(
+        logs=logs,
         has_more=has_more,
         next_start_ms=rfc3339_to_ms(next_start) if next_start else None,
         next_end_ms=rfc3339_to_ms(next_end) if next_end else None,
     )
-    return out
 
 
 @app.get("/admin/render/logs/export", dependencies=[Depends(require_admin_key)])
