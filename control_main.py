@@ -15,6 +15,7 @@ import json
 import re
 import logging
 import time
+import random
 import datetime as dt
 from datetime import datetime, timedelta
 from typing import List, Optional, Iterator, Any
@@ -427,6 +428,47 @@ def _extract_level_from_labels(labels: Any) -> str | None:
     return None
 
 
+def _render_get_json_with_backoff(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout_s: float | None = None,
+    max_retries: int = 5,
+    base_sleep_s: float = 0.6,
+):
+    """Call Render API with exponential backoff on 429/5xx.
+
+    This prevents the Portal "Load all" / export loops from immediately failing when
+    Render rate-limits. Retries are bounded and add jitter to avoid thundering herds.
+    """
+    attempt = 0
+    while True:
+        try:
+            if timeout_s is None:
+                return render_get_json(path, params=params)
+            return render_get_json(path, params=params, timeout_s=timeout_s)
+        except RenderAPIError as e:
+            status = getattr(e, "status", None)
+            body = getattr(e, "body", None)
+            retryable = (status == 429) or (isinstance(status, int) and 500 <= status <= 599)
+            if (not retryable) or attempt >= max_retries:
+                raise
+
+            # exponential backoff + jitter
+            sleep_s = base_sleep_s * (2**attempt) + random.uniform(0.0, 0.25)
+            if DEBUG_RENDER_LOGS:
+                logger.warning(
+                    "RENDER_BACKOFF status=%s attempt=%s sleep_s=%.2f body=%s",
+                    status,
+                    attempt + 1,
+                    sleep_s,
+                    body,
+                )
+            time.sleep(sleep_s)
+            attempt += 1
+            continue
+
+
 @app.get(
     "/admin/render/services",
     response_model=List[RenderServiceOut],
@@ -472,7 +514,7 @@ def admin_render_list_services(limit: int = Query(default=100, ge=1, le=200)):
         params["ownerId"] = owner_id
 
     try:
-        data = render_get_json("/v1/services", params=params)
+        data = _render_get_json_with_backoff("/v1/services", params=params)
         return _parse_services(data)
     except RenderAPIError as e:
         logger.error(
@@ -483,7 +525,7 @@ def admin_render_list_services(limit: int = Query(default=100, ge=1, le=200)):
         )
         # If ownerId filter is misconfigured, retry once without it.
         if owner_id and getattr(e, "status", None) == 400:
-            data2 = render_get_json("/v1/services", params={"limit": str(limit)})
+            data2 = _render_get_json_with_backoff("/v1/services", params={"limit": str(limit)})
             return _parse_services(data2)
         raise HTTPException(status_code=getattr(e, "status", 502), detail=getattr(e, "body", "upstream_error"))
     except Exception as ex:
@@ -498,7 +540,7 @@ def admin_render_list_services(limit: int = Query(default=100, ge=1, le=200)):
 )
 def admin_render_list_instances(service_id: str):
     try:
-        data = render_get_json(f"/v1/services/{service_id}/instances", params={"limit": "50"})
+        data = _render_get_json_with_backoff(f"/v1/services/{service_id}/instances", params={"limit": "50"})
     except RenderAPIError as e:
         raise HTTPException(status_code=e.status, detail=e.body)
     except Exception as e:
@@ -566,7 +608,7 @@ def admin_render_logs(
         params["text"] = [q]
 
     try:
-        data = render_get_json("/v1/logs", params=params)
+        data = _render_get_json_with_backoff("/v1/logs", params=params)
     except RenderAPIError as e:
         # Fail-soft for preview: if Render is flaky, show empty rows instead of breaking UI.
         body = getattr(e, "body", "") or ""
@@ -706,7 +748,7 @@ def admin_render_logs_export(
             params["endTime"] = ms_to_rfc3339(cur_end)
 
             try:
-                data = render_get_json("/v1/logs", params=params, timeout_s=30.0)
+                data = _render_get_json_with_backoff("/v1/logs", params=params, timeout_s=30.0)
             except RenderAPIError as e:
                 err = f"[export error] Render API error {getattr(e, 'status', None)}: {getattr(e, 'body', '')}"
                 if fmt == "csv":
