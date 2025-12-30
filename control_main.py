@@ -433,10 +433,16 @@ def admin_render_list_services(
     """
     Lists Render services using the Render API key.
 
-    IMPORTANT:
-    - Render /v1/services can return items shaped as {cursor, service:{...}}
-    - If RENDER_OWNER_ID is configured and causes a 400 upstream, we retry once without it.
+    NOTE: Render list endpoints use cursor pagination.
+    - Default limit: 20
+    - Max limit: 100
     """
+    # Clamp to Render's documented max
+    if limit > 100:
+        if DEBUG_RENDER_LOGS:
+            logger.info("RENDER_LIST_SERVICES clamp_limit requested=%s clamped=%s", limit, 100)
+        limit = 100
+
     def _parse_services(data) -> List[RenderServiceOut]:
         if isinstance(data, list):
             items = data
@@ -474,7 +480,6 @@ def admin_render_list_services(
         return _parse_services(data)
 
     except RenderAPIError as e:
-        # Add concrete logging for diagnosis
         logger.error(
             "RENDER_LIST_SERVICES upstream_error status=%s owner_id=%s body=%s",
             getattr(e, "status", None),
@@ -486,8 +491,7 @@ def admin_render_list_services(
         if owner_id and getattr(e, "status", None) == 400:
             try:
                 logger.warning("RENDER_LIST_SERVICES retry_without_ownerId owner_id=%s", owner_id)
-                params.pop("ownerId", None)
-                data2 = render_get_json("/v1/services", params=params)
+                data2 = render_get_json("/v1/services", params={"limit": str(limit)})
                 return _parse_services(data2)
             except RenderAPIError as e2:
                 logger.error(
@@ -505,6 +509,7 @@ def admin_render_list_services(
     except Exception as ex:
         logger.exception("RENDER_LIST_SERVICES exception")
         raise HTTPException(status_code=500, detail=str(ex))
+
 
 
 
