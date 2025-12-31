@@ -1,2 +1,2 @@
-Last good known update Dec 30 3:00PM added render log queries to portal completed 
-working on long-term memory 
+Last good known update Dec 31 1:00AM added render log queries to portal completed 
+completed the first iteratio of long-term memory
