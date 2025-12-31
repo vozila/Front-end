@@ -1,13 +1,25 @@
 # services/settings_service.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
+
 from sqlalchemy.orm import Session
 
 from models import User, UserSetting
 
-DEFAULTS = {
+# -----------------------------
+# Defaults (single source of truth for Control Plane UI)
+# -----------------------------
+
+DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
+    "You are Vozlia. Given email metadata (subject, sender, snippet, date), "
+    "produce a VERY short spoken-style summary (1–3 sentences). "
+    "Do NOT read email addresses or long codes out loud."
+)
+
+DEFAULTS: dict[str, dict[str, Any]] = {
     "agent_greeting": {"text": "Hello! How can I assist you today?"},
+    # Back-compat flag (still used by Portal UI today)
     "gmail_summary_enabled": {"enabled": True},
     "gmail_account_id": {"account_id": "d8c8cd99-c9bc-4e8c-a560-d220782665a1"},
     "gmail_enabled_accounts": {"account_ids": []},
@@ -15,57 +27,62 @@ DEFAULTS = {
         "text": (
             "CALL OPENING RULE (FIRST UTTERANCE ONLY): "
             "Greet the caller and introduce yourself as Vozlia in one short sentence. "
-            "Example: \"Hello, you're speaking with Vozlia — how can I help today?\" "
+            'Example: "Hello, you\'re speaking with Vozlia — how can I help today?" '
             "Do not repeat the brand intro after the first utterance."
         )
     },
+    # NEW: modular per-skill configuration (future skills slot into this shape)
+    "skills_config": {
+        "skills": {
+            "gmail_summary": {
+                "enabled": True,
+                "add_to_greeting": False,
+                # Keep conservative default to preserve current behavior.
+                "engagement_phrases": ["email summaries"],
+                "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
+            }
+        }
+    },
+    # NEW: memory controls (migrating from env vars into DB-configurable toggles)
+    "shortterm_memory_enabled": {"enabled": True},
+    "longterm_memory_enabled": {"enabled": False},
+    "memory_engagement_phrases": {"phrases": []},
 }
-
-def get_realtime_prompt_addendum(db: Session, user: User) -> str:
-    v = get_setting(db, user, "realtime_prompt_addendum")
-    txt = (v or {}).get("text")
-    if isinstance(txt, str) and txt.strip():
-        return txt.strip()
-    return DEFAULTS["realtime_prompt_addendum"]["text"]
 
 
 def get_setting(db: Session, user: User, key: str) -> dict:
-    row = (
-        db.query(UserSetting)
-        .filter(UserSetting.user_id == user.id, UserSetting.key == key)
-        .first()
-    )
+    row = db.query(UserSetting).filter(UserSetting.user_id == user.id, UserSetting.key == key).first()
     if row and isinstance(row.value, dict):
         return row.value
     return DEFAULTS.get(key, {})
 
-def set_setting(db: Session, user: User, key: str, value: dict) -> dict:
-    row = (
-        db.query(UserSetting)
-        .filter(UserSetting.user_id == user.id, UserSetting.key == key)
-        .first()
-    )
+
+def set_setting(db: Session, user: User, key: str, value: dict) -> None:
+    row = db.query(UserSetting).filter(UserSetting.user_id == user.id, UserSetting.key == key).first()
     if row:
-        row.value = value
+        row.value = value or {}
     else:
-        row = UserSetting(user_id=user.id, key=key, value=value)
+        row = UserSetting(user_id=user.id, key=key, value=value or {})
         db.add(row)
-
     db.commit()
-    db.refresh(row)
-    return row.value
 
+
+# -----------------------------
+# Existing settings (back-compat)
+# -----------------------------
 def get_agent_greeting(db: Session, user: User) -> str:
     v = get_setting(db, user, "agent_greeting")
-    txt = (v or {}).get("text")
-    if isinstance(txt, str) and txt.strip():
-        return txt.strip()
-    return DEFAULTS["agent_greeting"]["text"]
+    t = (v or {}).get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return str(DEFAULTS["agent_greeting"]["text"])
+
 
 def gmail_summary_enabled(db: Session, user: User) -> bool:
     v = get_setting(db, user, "gmail_summary_enabled")
     enabled = (v or {}).get("enabled")
     return bool(True if enabled is None else enabled)
+
 
 def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     v = get_setting(db, user, "gmail_account_id")
@@ -75,12 +92,15 @@ def get_selected_gmail_account_id(db: Session, user: User) -> Optional[str]:
     return None
 
 
-def get_enabled_gmail_account_ids(db: Session, user: User) -> Optional[list[str]]:
-    """Return the allowlist of Gmail account IDs that are enabled/searchable.
+def get_realtime_prompt_addendum(db: Session, user: User) -> str:
+    v = get_setting(db, user, "realtime_prompt_addendum")
+    t = (v or {}).get("text")
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return str(DEFAULTS["realtime_prompt_addendum"]["text"])
 
-    Convention:
-    - None or [] means "no allowlist" → treat as "all active Gmail accounts enabled".
-    """
+
+def get_enabled_gmail_account_ids(db: Session, user: User) -> Optional[list[str]]:
     v = get_setting(db, user, "gmail_enabled_accounts")
     account_ids = (v or {}).get("account_ids")
     if account_ids is None:
@@ -94,3 +114,55 @@ def get_enabled_gmail_account_ids(db: Session, user: User) -> Optional[list[str]
 def set_enabled_gmail_account_ids(db: Session, user: User, account_ids: list[str]) -> None:
     cleaned = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
     set_setting(db, user, "gmail_enabled_accounts", {"account_ids": cleaned})
+
+
+# -----------------------------
+# NEW: Skill config (modular)
+# -----------------------------
+def get_skills_config(db: Session, user: User) -> dict[str, dict]:
+    v = get_setting(db, user, "skills_config")
+    skills = (v or {}).get("skills")
+    if isinstance(skills, dict):
+        out: dict[str, dict] = {}
+        for k, cfg in skills.items():
+            if isinstance(k, str) and isinstance(cfg, dict):
+                out[k] = cfg
+        return out
+    # fall back to defaults
+    return dict(DEFAULTS["skills_config"]["skills"])
+
+
+def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
+    current = get_skills_config(db, user)
+    base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+    # merge allowed keys
+    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+        if k in patch:
+            base[k] = patch[k]
+    current[skill_id] = base
+    set_setting(db, user, "skills_config", {"skills": current})
+    return current
+
+
+# -----------------------------
+# NEW: Memory config (migrating env vars)
+# -----------------------------
+def shortterm_memory_enabled(db: Session, user: User) -> bool:
+    v = get_setting(db, user, "shortterm_memory_enabled")
+    enabled = (v or {}).get("enabled")
+    return bool(True if enabled is None else enabled)
+
+
+def longterm_memory_enabled(db: Session, user: User) -> bool:
+    v = get_setting(db, user, "longterm_memory_enabled")
+    enabled = (v or {}).get("enabled")
+    return bool(False if enabled is None else enabled)
+
+
+def get_memory_engagement_phrases(db: Session, user: User) -> list[str]:
+    v = get_setting(db, user, "memory_engagement_phrases")
+    phrases = (v or {}).get("phrases")
+    if isinstance(phrases, list):
+        cleaned = [str(x).strip() for x in phrases if str(x).strip()]
+        return cleaned
+    return list(DEFAULTS["memory_engagement_phrases"]["phrases"])
