@@ -41,7 +41,14 @@ from services.settings_service import (
     get_enabled_gmail_account_ids,
     set_setting,
     set_enabled_gmail_account_ids,
+    # NEW
+    get_skills_config,
+    patch_skill_config,
+    shortterm_memory_enabled,
+    longterm_memory_enabled,
+    get_memory_engagement_phrases,
 )
+
 from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, RenderAPIError
 
 
@@ -117,31 +124,72 @@ def health() -> str:
 # SETTINGS
 # =========================
 
+# SETTINGS
+# =========================
+
+class SkillConfig(BaseModel):
+    enabled: bool = True
+    add_to_greeting: bool = False
+    engagement_phrases: List[str] = Field(default_factory=list)
+    llm_prompt: str = ""
+
+
 class AdminSettingsOut(BaseModel):
+    # Legacy / current
     agent_greeting: str
     gmail_summary_enabled: bool
     gmail_account_id: Optional[str] = None
     gmail_enabled_account_ids: Optional[List[str]] = None
     realtime_prompt_addendum: str
 
+    # New (modular)
+    skills_config: Dict[str, SkillConfig] = Field(default_factory=dict)
+
+    # Memory (migrated from env vars)
+    shortterm_memory_enabled: bool = True
+    longterm_memory_enabled: bool = False
+    memory_engagement_phrases: List[str] = Field(default_factory=list)
+
 
 class AdminSettingsPatch(BaseModel):
+    # Legacy / current
     agent_greeting: str | None = Field(default=None, min_length=1, max_length=500)
     gmail_summary_enabled: bool | None = None
     gmail_account_id: str | None = None
     gmail_enabled_account_ids: List[str] | None = None
     realtime_prompt_addendum: str | None = Field(default=None, min_length=1, max_length=4000)
 
+    # New (modular)
+    skills_config: Dict[str, SkillConfig] | None = None
+
+    # Memory
+    shortterm_memory_enabled: bool | None = None
+    longterm_memory_enabled: bool | None = None
+    memory_engagement_phrases: List[str] | None = None
+
 
 @app.get("/admin/settings", response_model=AdminSettingsOut, dependencies=[Depends(require_admin_key)])
 def get_settings(db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
+    skills = get_skills_config(db, user)
+
+    # Back-compat: ensure gmail_summary.enabled mirrors legacy toggle if present.
+    gmail_enabled = gmail_summary_enabled(db, user)
+    if "gmail_summary" in skills and isinstance(skills["gmail_summary"], dict):
+        skills["gmail_summary"]["enabled"] = bool(gmail_enabled)
+    else:
+        skills["gmail_summary"] = {"enabled": bool(gmail_enabled)}
+
     return AdminSettingsOut(
         agent_greeting=get_agent_greeting(db, user),
-        gmail_summary_enabled=gmail_summary_enabled(db, user),
+        gmail_summary_enabled=gmail_enabled,
         gmail_account_id=get_selected_gmail_account_id(db, user),
         gmail_enabled_account_ids=get_enabled_gmail_account_ids(db, user),
         realtime_prompt_addendum=get_realtime_prompt_addendum(db, user),
+        skills_config=skills,
+        shortterm_memory_enabled=shortterm_memory_enabled(db, user),
+        longterm_memory_enabled=longterm_memory_enabled(db, user),
+        memory_engagement_phrases=get_memory_engagement_phrases(db, user),
     )
 
 
@@ -154,7 +202,10 @@ def patch_settings(payload: AdminSettingsPatch, db: Session = Depends(get_db)):
         set_setting(db, user, "agent_greeting", {"text": data["agent_greeting"].strip()})
 
     if "gmail_summary_enabled" in data:
+        # legacy toggle
         set_setting(db, user, "gmail_summary_enabled", {"enabled": bool(data["gmail_summary_enabled"])})
+        # also mirror into skills_config.gmail_summary.enabled for future unification
+        patch_skill_config(db, user, "gmail_summary", {"enabled": bool(data["gmail_summary_enabled"])})
 
     if "gmail_account_id" in data:
         set_setting(db, user, "gmail_account_id", {"account_id": data["gmail_account_id"].strip()})
@@ -165,7 +216,30 @@ def patch_settings(payload: AdminSettingsPatch, db: Session = Depends(get_db)):
     if "realtime_prompt_addendum" in data:
         set_setting(db, user, "realtime_prompt_addendum", {"text": data["realtime_prompt_addendum"].strip()})
 
+    # New modular skill config
+    if "skills_config" in data and isinstance(data["skills_config"], dict):
+        for sid, cfg in data["skills_config"].items():
+            if not isinstance(sid, str) or not isinstance(cfg, dict):
+                continue
+            patch_skill_config(db, user, sid, cfg)
+
+    # Memory toggles
+    if "shortterm_memory_enabled" in data:
+        set_setting(db, user, "shortterm_memory_enabled", {"enabled": bool(data["shortterm_memory_enabled"])})
+
+    if "longterm_memory_enabled" in data:
+        set_setting(db, user, "longterm_memory_enabled", {"enabled": bool(data["longterm_memory_enabled"])})
+
+    if "memory_engagement_phrases" in data:
+        phrases = data.get("memory_engagement_phrases") or []
+        cleaned = [str(x).strip() for x in (phrases if isinstance(phrases, list) else []) if str(x).strip()]
+        set_setting(db, user, "memory_engagement_phrases", {"phrases": cleaned})
+
     return get_settings(db)
+
+
+# =========================
+
 
 
 # =========================
