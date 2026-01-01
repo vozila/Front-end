@@ -37,7 +37,6 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "gmail_summary": {
                 "enabled": True,
                 "add_to_greeting": False,
-                "auto_execute_after_greeting": False,
                 # Keep conservative default to preserve current behavior.
                 "engagement_phrases": ["email summaries"],
                 "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
@@ -48,6 +47,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
     "shortterm_memory_enabled": {"enabled": True},
     "longterm_memory_enabled": {"enabled": False},
     "memory_engagement_phrases": {"phrases": []},
+    "skills_priority_order": {"order": ["gmail_summary", "memory", "sms", "calendar", "web_search", "weather", "investment_reporting"]},
 }
 
 
@@ -144,6 +144,30 @@ def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> d
     set_setting(db, user, "skills_config", {"skills": current})
     return current
 
+
+
+def get_skills_priority_order(db: Session, user: User) -> list[str]:
+    v = get_setting(db, user, "skills_priority_order")
+    order = (v or {}).get("order")
+    if isinstance(order, list):
+        cleaned: list[str] = []
+        for s in order:
+            if isinstance(s, str) and s.strip():
+                cleaned.append(s.strip())
+        if cleaned:
+            return cleaned
+    d = DEFAULTS.get("skills_priority_order", {}).get("order")
+    if isinstance(d, list):
+        return [s for s in d if isinstance(s, str) and s.strip()]
+    return []
+
+
+def set_skills_priority_order(db: Session, user: User, order: list[str]) -> None:
+    cleaned: list[str] = []
+    for s in (order or []):
+        if isinstance(s, str) and s.strip():
+            cleaned.append(s.strip())
+    set_setting(db, user, "skills_priority_order", {"order": cleaned})
 
 # -----------------------------
 # NEW: Memory config (migrating env vars)
