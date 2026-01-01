@@ -37,6 +37,7 @@ DEFAULTS: dict[str, dict[str, Any]] = {
             "gmail_summary": {
                 "enabled": True,
                 "add_to_greeting": False,
+                "auto_execute_after_greeting": False,
                 # Keep conservative default to preserve current behavior.
                 "engagement_phrases": ["email summaries"],
                 "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
@@ -136,7 +137,7 @@ def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> d
     current = get_skills_config(db, user)
     base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
     # merge allowed keys
-    for k in ("enabled", "add_to_greeting", "engagement_phrases", "llm_prompt"):
+    for k in ("enabled", "add_to_greeting", "auto_execute_after_greeting", "engagement_phrases", "llm_prompt"):
         if k in patch:
             base[k] = patch[k]
     current[skill_id] = base
