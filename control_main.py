@@ -20,7 +20,15 @@ import urllib.error
 import socket
 import datetime as dt
 from datetime import datetime, timedelta
-from typing import List, Optional, Iterator, Any
+from typing import List, Optional, Iterator, Any, Dict
+
+# Default prompts (UI wiring). Keep stable unless you intentionally change behavior.
+DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
+    "You are Vozlia. Given email metadata (subject, sender, snippet, date), "
+    "produce a VERY short spoken-style summary (1–3 sentences). "
+    "Do NOT read email addresses or long codes out loud."
+)
+
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
@@ -168,17 +176,43 @@ class AdminSettingsPatch(BaseModel):
     memory_engagement_phrases: List[str] | None = None
 
 
+# Pydantic v2 + postponed annotations: ensure models are fully built before use
+try:
+    SkillConfig.model_rebuild()
+except Exception:
+    pass
+try:
+    AdminSettingsOut.model_rebuild()
+except Exception:
+    pass
+try:
+    AdminSettingsPatch.model_rebuild()
+except Exception:
+    pass
+
+
 @app.get("/admin/settings", response_model=AdminSettingsOut, dependencies=[Depends(require_admin_key)])
 def get_settings(db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
     skills = get_skills_config(db, user)
 
-    # Back-compat: ensure gmail_summary.enabled mirrors legacy toggle if present.
+    # Back-compat + defaults: ensure gmail_summary config is fully populated and enabled mirrors legacy toggle.
     gmail_enabled = gmail_summary_enabled(db, user)
-    if "gmail_summary" in skills and isinstance(skills["gmail_summary"], dict):
-        skills["gmail_summary"]["enabled"] = bool(gmail_enabled)
+
+    gmail_defaults = {
+        "enabled": bool(gmail_enabled),
+        "add_to_greeting": False,
+        "engagement_phrases": ["email summaries"],
+        "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
+    }
+    existing = skills.get("gmail_summary") if isinstance(skills, dict) else None
+    if isinstance(existing, dict):
+        merged = {**gmail_defaults, **existing}
     else:
-        skills["gmail_summary"] = {"enabled": bool(gmail_enabled)}
+        merged = dict(gmail_defaults)
+
+    merged["enabled"] = bool(gmail_enabled)
+    skills["gmail_summary"] = merged
 
     return AdminSettingsOut(
         agent_greeting=get_agent_greeting(db, user),
