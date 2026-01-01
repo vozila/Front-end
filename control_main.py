@@ -138,6 +138,7 @@ def health() -> str:
 class SkillConfig(BaseModel):
     enabled: bool = True
     add_to_greeting: bool = False
+    auto_execute_after_greeting: bool = False
     engagement_phrases: List[str] = Field(default_factory=list)
     llm_prompt: str = ""
 
@@ -194,7 +195,21 @@ except Exception:
 @app.get("/admin/settings", response_model=AdminSettingsOut, dependencies=[Depends(require_admin_key)])
 def get_settings(db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-    skills = get_skills_config(db, user)
+
+    raw_skills = get_skills_config(db, user)
+    # Normalize all skill configs to a common shape (future skills plug in automatically)
+    base_defaults = {
+        "enabled": True,
+        "add_to_greeting": False,
+        "auto_execute_after_greeting": False,
+        "engagement_phrases": [],
+        "llm_prompt": "",
+    }
+    skills: dict[str, dict] = {}
+    if isinstance(raw_skills, dict):
+        for sid, cfg in raw_skills.items():
+            if isinstance(sid, str) and isinstance(cfg, dict):
+                skills[sid] = {**base_defaults, **cfg}
 
     # Back-compat + defaults: ensure gmail_summary config is fully populated and enabled mirrors legacy toggle.
     gmail_enabled = gmail_summary_enabled(db, user)
@@ -202,6 +217,7 @@ def get_settings(db: Session = Depends(get_db)):
     gmail_defaults = {
         "enabled": bool(gmail_enabled),
         "add_to_greeting": False,
+        "auto_execute_after_greeting": False,
         "engagement_phrases": ["email summaries"],
         "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
     }
