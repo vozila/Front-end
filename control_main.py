@@ -52,6 +52,8 @@ from services.settings_service import (
     # NEW
     get_skills_config,
     patch_skill_config,
+    get_skills_priority_order,
+    set_skills_priority_order,
     shortterm_memory_enabled,
     longterm_memory_enabled,
     get_memory_engagement_phrases,
@@ -162,6 +164,7 @@ class AdminSettingsOut(BaseModel):
 
 class AdminSettingsPatch(BaseModel):
     # Legacy / current
+    skills_priority_order: Optional[List[str]] = None
     agent_greeting: str | None = Field(default=None, min_length=1, max_length=500)
     gmail_summary_enabled: bool | None = None
     gmail_account_id: str | None = None
@@ -195,21 +198,7 @@ except Exception:
 @app.get("/admin/settings", response_model=AdminSettingsOut, dependencies=[Depends(require_admin_key)])
 def get_settings(db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-
-    raw_skills = get_skills_config(db, user)
-    # Normalize all skill configs to a common shape (future skills plug in automatically)
-    base_defaults = {
-        "enabled": True,
-        "add_to_greeting": False,
-        "auto_execute_after_greeting": False,
-        "engagement_phrases": [],
-        "llm_prompt": "",
-    }
-    skills: dict[str, dict] = {}
-    if isinstance(raw_skills, dict):
-        for sid, cfg in raw_skills.items():
-            if isinstance(sid, str) and isinstance(cfg, dict):
-                skills[sid] = {**base_defaults, **cfg}
+    skills = get_skills_config(db, user)
 
     # Back-compat + defaults: ensure gmail_summary config is fully populated and enabled mirrors legacy toggle.
     gmail_enabled = gmail_summary_enabled(db, user)
@@ -217,7 +206,6 @@ def get_settings(db: Session = Depends(get_db)):
     gmail_defaults = {
         "enabled": bool(gmail_enabled),
         "add_to_greeting": False,
-        "auto_execute_after_greeting": False,
         "engagement_phrases": ["email summaries"],
         "llm_prompt": DEFAULT_GMAIL_SUMMARY_LLM_PROMPT,
     }
