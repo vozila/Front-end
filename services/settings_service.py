@@ -134,15 +134,64 @@ def get_skills_config(db: Session, user: User) -> dict[str, dict]:
 
 
 def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
+    """
+    Merge and persist a per-skill config patch.
+
+    Notes:
+    - Accept both snake_case (backend) and camelCase (portal UI) keys.
+    - Parse string fields into lists where appropriate (engagement prompt, tickers).
+    - Fail-open: unknown keys are ignored.
+    """
     current = get_skills_config(db, user)
     base = dict(current.get(skill_id) or DEFAULTS["skills_config"]["skills"].get(skill_id, {}))
+
+    # Normalize alternate keys coming from the portal
+    normalized = dict(patch or {})
+
+    # engagementPrompt / engagement_prompt -> engagement_phrases
+    if "engagement_phrases" not in normalized:
+        alt = normalized.get("engagementPrompt") or normalized.get("engagement_prompt")
+        if isinstance(alt, str):
+            # allow newline-separated or comma-separated
+            phrases = []
+            for line in alt.replace(",", "\n").splitlines():
+                s = line.strip()
+                if s:
+                    phrases.append(s)
+            normalized["engagement_phrases"] = phrases
+
+    # llmPrompt -> llm_prompt
+    if "llm_prompt" not in normalized and isinstance(normalized.get("llmPrompt"), str):
+        normalized["llm_prompt"] = normalized["llmPrompt"]
+
+    # tickers: allow list or comma-separated string
+    if "tickers" in normalized and isinstance(normalized["tickers"], str):
+        raw = normalized["tickers"]
+        tickers = []
+        for part in raw.split(","):
+            t = part.strip().upper()
+            if t:
+                tickers.append(t)
+        normalized["tickers"] = tickers
+        normalized.setdefault("tickers_raw", raw)
+
     # merge allowed keys
-    for k in ("enabled", "add_to_greeting", "auto_execute_after_greeting", "engagement_phrases", "llm_prompt"):
-        if k in patch:
-            base[k] = patch[k]
+    for k in (
+        "enabled",
+        "add_to_greeting",
+        "auto_execute_after_greeting",
+        "engagement_phrases",
+        "llm_prompt",
+        "tickers",
+        "tickers_raw",
+    ):
+        if k in normalized:
+            base[k] = normalized[k]
+
     current[skill_id] = base
     set_setting(db, user, "skills_config", {"skills": current})
     return current
+
 
 
 
