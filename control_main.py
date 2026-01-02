@@ -144,6 +144,10 @@ class SkillConfig(BaseModel):
     engagement_phrases: List[str] = Field(default_factory=list)
     llm_prompt: str = ""
 
+    # Optional per-skill fields (used by some skills, e.g. investment_reporting)
+    tickers: List[str] = Field(default_factory=list)
+    tickers_raw: Optional[str] = None
+
 
 class AdminSettingsOut(BaseModel):
     # Legacy / current
