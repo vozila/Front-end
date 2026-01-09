@@ -61,6 +61,11 @@ from services.settings_service import (
 
 from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, RenderAPIError
 
+from models import EmailAccount
+from admin_memory import build_memory_router
+
+
+
 
 logger = logging.getLogger("vozlia.control")
 DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
@@ -94,6 +99,8 @@ def require_admin_key(
 
 app = FastAPI(title="Vozlia Control")
 
+# Admin Memory (long-term memory table + delete) for WebUI debugging
+app.include_router(build_memory_router(require_admin_key))
 
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
