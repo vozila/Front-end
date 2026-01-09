@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from deps import get_db
 from db import Base, engine
@@ -357,13 +357,71 @@ def _to_email_out(a: EmailAccount) -> EmailAccountOut:
     )
 
 
+
+# -----------------------------------------------------------------------------
+# EmailAccount schema drift guard (admin endpoints)
+# -----------------------------------------------------------------------------
+# In production we've seen DB/schema drift where sensitive token columns get renamed
+# (e.g. `access_token_enc` vs `oauth_access_token`). The Admin Portal listing/toggles
+# should NOT depend on token columns at all.
+#
+# To keep /admin/email-accounts and PATCH toggles working even if token columns are
+# missing, we only SELECT the non-secret fields used by EmailAccountOut.
+#
+# NOTE: We also use a scoped refresh (attribute_names=...) because SQLAlchemy expires
+# instances on commit by default (expire_on_commit=True). A full refresh would re-select
+# missing columns and re-trigger a 500.
+_EMAIL_ACCOUNT_PUBLIC_FIELDS = (
+    "id",
+    "user_id",
+    "provider_type",
+    "oauth_provider",
+    "email_address",
+    "display_name",
+    "is_primary",
+    "is_active",
+    "imap_host",
+    "imap_port",
+    "imap_ssl",
+    "smtp_host",
+    "smtp_port",
+    "smtp_ssl",
+    "username",
+    "created_at",
+    "updated_at",
+)
+
+# Precompute existing mapped attributes (defensive across code versions)
+_EMAIL_ACCOUNT_PUBLIC_ATTR_NAMES = [n for n in _EMAIL_ACCOUNT_PUBLIC_FIELDS if hasattr(EmailAccount, n)]
+
+
+def _email_account_public_query(db: Session):
+    q = db.query(EmailAccount)
+    cols = []
+    for name in _EMAIL_ACCOUNT_PUBLIC_FIELDS:
+        attr = getattr(EmailAccount, name, None)
+        if attr is not None:
+            cols.append(attr)
+    if cols:
+        q = q.options(load_only(*cols))
+    return q
+
+
+def _refresh_email_account_public(db: Session, a: EmailAccount) -> None:
+    # SQLAlchemy 2.x supports attribute_names to scope the refresh query.
+    try:
+        db.refresh(a, attribute_names=_EMAIL_ACCOUNT_PUBLIC_ATTR_NAMES)
+    except Exception:
+        # Last resort (should be avoided if schema drift exists)
+        db.refresh(a)
+
 @app.get("/admin/email-accounts", response_model=List[EmailAccountOut], dependencies=[Depends(require_admin_key)])
 def list_email_accounts(
     include_inactive: bool = Query(default=True),
     db: Session = Depends(get_db),
 ):
     user = get_or_create_primary_user(db)
-    q = db.query(EmailAccount).filter(EmailAccount.user_id == user.id)
+    q = _email_account_public_query(db).filter(EmailAccount.user_id == user.id)
     if not include_inactive:
         q = q.filter(EmailAccount.is_active == True)  # noqa: E712
     rows = q.order_by(EmailAccount.created_at.desc()).all()
@@ -384,7 +442,7 @@ def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail="email_address is required")
 
     a = (
-        db.query(EmailAccount)
+        _email_account_public_query(db)
         .filter(
             EmailAccount.user_id == user.id,
             EmailAccount.provider_type == "gmail",
@@ -434,14 +492,14 @@ def upsert_gmail_account(payload: GmailUpsertRequest, db: Session = Depends(get_
         a.is_primary = True
 
     db.commit()
-    db.refresh(a)
+    _refresh_email_account_public(db, a)
     return _to_email_out(a)
 
 
 @app.patch("/admin/email-accounts/{account_id}", response_model=EmailAccountOut, dependencies=[Depends(require_admin_key)])
 def patch_email_account(account_id: str, payload: EmailAccountPatch, db: Session = Depends(get_db)):
     user = get_or_create_primary_user(db)
-    a = db.query(EmailAccount).filter(EmailAccount.id == account_id, EmailAccount.user_id == user.id).first()
+    a = _email_account_public_query(db).filter(EmailAccount.id == account_id, EmailAccount.user_id == user.id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Email account not found")
 
@@ -461,7 +519,7 @@ def patch_email_account(account_id: str, payload: EmailAccountPatch, db: Session
         a.is_primary = True
 
     db.commit()
-    db.refresh(a)
+    _refresh_email_account_public(db, a)
     return _to_email_out(a)
 
 
@@ -473,7 +531,7 @@ def delete_email_account(
 ):
     """Disconnect an email account."""
     user = get_or_create_primary_user(db)
-    a = db.query(EmailAccount).filter(EmailAccount.id == account_id, EmailAccount.user_id == user.id).first()
+    a = _email_account_public_query(db).filter(EmailAccount.id == account_id, EmailAccount.user_id == user.id).first()
     if not a:
         raise HTTPException(status_code=404, detail="Email account not found")
 
