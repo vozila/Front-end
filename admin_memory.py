@@ -9,20 +9,38 @@ Purpose:
 Security:
 - These routes MUST be protected by the control-plane admin key dependency passed in
   from control_main.py (X-Vozlia-Admin-Key).
+
+Notes:
+- This is *debug/admin* functionality. Keep the query logic simple and predictable.
+- Search is a basic substring match (ILIKE). This is NOT vector search.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import or_, cast, String
+from sqlalchemy import Text, cast, or_
 from sqlalchemy.orm import Session
 
 from deps import get_db
 from models import CallerMemoryEvent
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Ensure a datetime is timezone-aware UTC.
+
+    We store created_at using UTC timestamps, but depending on the column type
+    (timestamp without time zone) + driver behavior, SQLAlchemy may return a
+    *naive* datetime. If we serialize a naive datetime, JS clients may treat it
+    as *local* time, which can make rows look like they were created on the wrong
+    day/time.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class LongTermMemoryRowOut(BaseModel):
@@ -38,11 +56,11 @@ class LongTermMemoryRowOut(BaseModel):
     text: str
 
     data_json: Optional[Dict[str, Any]] = None
-    tags_json: Optional[Any] = None
+    tags_json: Optional[Dict[str, Any]] = None
 
 
 class LongTermMemoryListOut(BaseModel):
-    items: List[LongTermMemoryRowOut]
+    items: List[LongTermMemoryRowOut] = []
     has_more: bool = False
     next_offset: Optional[int] = None
 
@@ -62,7 +80,11 @@ def build_memory_router(require_admin_key) -> APIRouter:
 
     @router.get("/longterm", response_model=LongTermMemoryListOut)
     def list_longterm_memory(
-        q: Optional[str] = Query(default=None, description="Substring search across text/skill/caller/call_sid/kind"),
+        # Primary search param used by the WebUI
+        q: Optional[str] = Query(default=None, description="Substring search across common fields (ILIKE)"),
+        # Alias for backwards/forwards compatibility (some clients use `search`)
+        search: Optional[str] = Query(default=None, description="Alias for `q` (legacy/compat)"),
+        # Optional exact filters (useful for narrowing during debugging)
         tenant_id: Optional[str] = Query(default=None),
         caller_id: Optional[str] = Query(default=None),
         call_sid: Optional[str] = Query(default=None),
@@ -76,14 +98,15 @@ def build_memory_router(require_admin_key) -> APIRouter:
 
         - default sort: newest first
         - pagination: offset/limit (+1 fetch to infer has_more)
-        - search: ILIKE on common fields (not vector search)
+        - search: ILIKE on common fields (and JSON payloads cast to text)
         """
         query = db.query(CallerMemoryEvent)
 
+        # Exact filters first
         if tenant_id:
-            query = query.filter(cast(CallerMemoryEvent.tenant_id, String) == tenant_id)
+            query = query.filter(CallerMemoryEvent.tenant_id == tenant_id)
         if caller_id:
-            query = query.filter(cast(CallerMemoryEvent.caller_id, String) == caller_id)
+            query = query.filter(CallerMemoryEvent.caller_id == caller_id)
         if call_sid:
             query = query.filter(CallerMemoryEvent.call_sid == call_sid)
         if skill_key:
@@ -91,23 +114,24 @@ def build_memory_router(require_admin_key) -> APIRouter:
         if kind:
             query = query.filter(CallerMemoryEvent.kind == kind)
 
-        if q:
-            q_str = (q or "").strip()
-            if q_str:
-                like = f"%{q_str}%"
-                # NOTE: tenant_id / caller_id are UUID in the DB. ILIKE on UUID fails unless cast.
-                query = query.filter(
-                    or_(
-                        CallerMemoryEvent.text.ilike(like),
-                        CallerMemoryEvent.skill_key.ilike(like),
-                        CallerMemoryEvent.call_sid.ilike(like),
-                        CallerMemoryEvent.kind.ilike(like),
-                        cast(CallerMemoryEvent.tenant_id, String).ilike(like),
-                        cast(CallerMemoryEvent.caller_id, String).ilike(like),
-                        # id is usually UUID too; casting keeps search robust across schema versions
-                        cast(CallerMemoryEvent.id, String).ilike(like),
-                    )
+        # Substring search (server-side)
+        q_str = (q or search or "").strip()
+        if q_str:
+            like = f"%{q_str}%"
+            query = query.filter(
+                or_(
+                    CallerMemoryEvent.text.ilike(like),
+                    CallerMemoryEvent.skill_key.ilike(like),
+                    cast(CallerMemoryEvent.caller_id, Text).ilike(like),
+                    CallerMemoryEvent.call_sid.ilike(like),
+                    CallerMemoryEvent.kind.ilike(like),
+                    cast(CallerMemoryEvent.tenant_id, Text).ilike(like),
+                    # Include meta JSON for debugging searches (cast JSONB->text)
+                    cast(CallerMemoryEvent.tags_json, Text).ilike(like),
+                    cast(CallerMemoryEvent.data_json, Text).ilike(like),
                 )
+            )
+
         query = query.order_by(CallerMemoryEvent.created_at.desc())
 
         rows = query.offset(offset).limit(limit + 1).all()
@@ -117,7 +141,7 @@ def build_memory_router(require_admin_key) -> APIRouter:
         items = [
             LongTermMemoryRowOut(
                 id=str(r.id),
-                created_at=r.created_at,
+                created_at=_as_utc(r.created_at),
                 tenant_id=str(r.tenant_id),
                 caller_id=str(r.caller_id),
                 call_sid=str(r.call_sid) if r.call_sid else None,
@@ -138,7 +162,7 @@ def build_memory_router(require_admin_key) -> APIRouter:
         memory_id: str,
         db: Session = Depends(get_db),
     ) -> DeleteOut:
-        row = db.query(CallerMemoryEvent).filter(cast(CallerMemoryEvent.id, String) == memory_id).first()
+        row = db.query(CallerMemoryEvent).filter(CallerMemoryEvent.id == memory_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Memory row not found")
         db.delete(row)
