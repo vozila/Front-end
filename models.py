@@ -1,4 +1,6 @@
 # models.py
+from __future__ import annotations
+
 from datetime import datetime
 from uuid import uuid4
 import enum
@@ -12,6 +14,7 @@ from sqlalchemy import (
     Integer,
     Text,
     Enum as SAEnum,
+    Index,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship
@@ -25,6 +28,7 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     email = Column(String, unique=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
     settings = relationship(
         "UserSetting",
         back_populates="user",
@@ -32,9 +36,8 @@ class User(Base):
         passive_deletes=True,
     )
 
-    # Relationships
     email_accounts = relationship("EmailAccount", back_populates="user")
-    # New: user ↔ tasks
+
     tasks = relationship(
         "Task",
         back_populates="user",
@@ -42,19 +45,28 @@ class User(Base):
         passive_deletes=True,
     )
 
+
 class UserSetting(Base):
     __tablename__ = "user_settings"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    id = Column(Integer, primary_key=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-
-    # e.g. "agent_greeting", "gmail_summary_enabled", "gmail_account_id"
     key = Column(String, nullable=False)
     value = Column(JSONB, nullable=False, default=dict)
 
-    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
     user = relationship("User", back_populates="settings")
+
+    __table_args__ = (
+        Index("ix_user_settings_user_key", "user_id", "key", unique=True),
+    )
+
+
+class ProviderType(str, enum.Enum):
+    gmail = "gmail"
+
+
+class OAuthProvider(str, enum.Enum):
+    google = "google"
 
 
 class EmailAccount(Base):
@@ -63,25 +75,14 @@ class EmailAccount(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
 
-    provider_type = Column(String, nullable=False)          # "gmail", "imap_custom", etc.
-    oauth_provider = Column(String, nullable=True)
-    oauth_access_token = Column(Text, nullable=True)
-    oauth_refresh_token = Column(Text, nullable=True)
-    oauth_expires_at = Column(DateTime, nullable=True)
+    provider_type = Column(SAEnum(ProviderType), nullable=False, default=ProviderType.gmail)
+    oauth_provider = Column(SAEnum(OAuthProvider), nullable=False, default=OAuthProvider.google)
 
-    imap_host = Column(String, nullable=True)
-    imap_port = Column(Integer, nullable=True)
-    imap_ssl = Column(Boolean, nullable=True)
-    smtp_host = Column(String, nullable=True)
-    smtp_port = Column(Integer, nullable=True)
-    smtp_ssl = Column(Boolean, nullable=True)
-    username = Column(String, nullable=True)
-    password_enc = Column(Text, nullable=True)
+    access_token_enc = Column(Text, nullable=True)
+    refresh_token_enc = Column(Text, nullable=True)
 
     email_address = Column(String, nullable=False)
     display_name = Column(String, nullable=True)
-
-    is_primary = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -90,16 +91,9 @@ class EmailAccount(Base):
     user = relationship("User", back_populates="email_accounts")
 
 
-# =========================
-# Task Engine Models
-# =========================
-
 class TaskStatus(str, enum.Enum):
     PENDING = "PENDING"
-    COLLECTING_INPUT = "COLLECTING_INPUT"
-    READY = "READY"
-    EXECUTING = "EXECUTING"
-    WAITING = "WAITING"
+    RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
     ERROR = "ERROR"
 
@@ -119,31 +113,58 @@ class Task(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
 
-    type = Column(SAEnum(TaskType, name="task_type_enum"), nullable=False)
-    status = Column(SAEnum(TaskStatus, name="task_status_enum"), nullable=False, default=TaskStatus.PENDING)
+    task_type = Column(SAEnum(TaskType), nullable=False)
+    status = Column(SAEnum(TaskStatus), nullable=False, default=TaskStatus.PENDING)
 
-    # Flexible JSON structures used by the task engine
-    # {
-    #   "required": [...],
-    #   "optional": {...},
-    #   "collected": {...}
-    # }
-    inputs = Column(JSONB, nullable=False, default=dict)
+    title = Column(String, nullable=True)
 
-    # {
-    #   "cursor": "step_name_or_index",
-    #   "context": {...},
-    #   "history": [...]
-    # }
+    input = Column(JSONB, nullable=False, default=dict)
     state = Column(JSONB, nullable=False, default=dict)
-
-    # {
-    #   "result": ...,
-    #   "error": "..."
-    # }
     execution = Column(JSONB, nullable=False, default=dict)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="tasks")
+
+
+# =========================
+# Long-term Memory (shared DB table with backend)
+# =========================
+
+class CallerMemoryEvent(Base):
+    """Mirrors backend.models.CallerMemoryEvent (caller_memory_events).
+
+    Used by the Control Plane for admin/debug tooling only.
+    """
+    __tablename__ = "caller_memory_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    tenant_id = Column(String, index=True, nullable=False)
+    caller_id = Column(String, index=True, nullable=False)
+    call_sid = Column(String, index=True, nullable=True)
+
+    kind = Column(String, index=True, nullable=False, default="event")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+
+    skill_key = Column(String, index=True, nullable=False)
+    text = Column(Text, nullable=False)
+
+    data_json = Column(JSONB, nullable=True)
+    tags_json = Column(JSONB, nullable=True)
+
+
+Index(
+    "ix_mem_tenant_caller_created",
+    CallerMemoryEvent.tenant_id,
+    CallerMemoryEvent.caller_id,
+    CallerMemoryEvent.created_at.desc(),
+)
+Index(
+    "ix_mem_tenant_caller_skill_created",
+    CallerMemoryEvent.tenant_id,
+    CallerMemoryEvent.caller_id,
+    CallerMemoryEvent.skill_key,
+    CallerMemoryEvent.created_at.desc(),
+)
