@@ -80,7 +80,6 @@ def build_memory_router(require_admin_key) -> APIRouter:
         """
         query = db.query(CallerMemoryEvent)
 
-        # NOTE: NOTE: in your DB these are UUID columns; comparing/searching as text is safest.
         if tenant_id:
             query = query.filter(cast(CallerMemoryEvent.tenant_id, String) == tenant_id)
         if caller_id:
@@ -96,7 +95,7 @@ def build_memory_router(require_admin_key) -> APIRouter:
             q_str = (q or "").strip()
             if q_str:
                 like = f"%{q_str}%"
-                # tenant_id / caller_id are UUID in the DB. ILIKE on UUID fails unless cast.
+                # NOTE: tenant_id / caller_id are UUID in the DB. ILIKE on UUID fails unless cast.
                 query = query.filter(
                     or_(
                         CallerMemoryEvent.text.ilike(like),
@@ -109,7 +108,6 @@ def build_memory_router(require_admin_key) -> APIRouter:
                         cast(CallerMemoryEvent.id, String).ilike(like),
                     )
                 )
-
         query = query.order_by(CallerMemoryEvent.created_at.desc())
 
         rows = query.offset(offset).limit(limit + 1).all()
