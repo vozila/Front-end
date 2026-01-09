@@ -61,28 +61,45 @@ class UserSetting(Base):
     )
 
 
-class ProviderType(str, enum.Enum):
-    gmail = "gmail"
-
-
-class OAuthProvider(str, enum.Enum):
-    google = "google"
-
-
 class EmailAccount(Base):
+    """Email accounts used for Gmail summaries + future IMAP/SMTP workflows.
+
+    IMPORTANT:
+    - This model must match the backend DB schema (email_accounts) because the Control Plane
+      reads/writes the same Postgres database.
+    - Tokens/passwords may be stored encrypted (Fernet) depending on your service logic.
+    """
+
     __tablename__ = "email_accounts"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
 
-    provider_type = Column(SAEnum(ProviderType), nullable=False, default=ProviderType.gmail)
-    oauth_provider = Column(SAEnum(OAuthProvider), nullable=False, default=OAuthProvider.google)
+    # "gmail", "imap_custom", etc.
+    provider_type = Column(String, nullable=False)
 
-    access_token_enc = Column(Text, nullable=True)
-    refresh_token_enc = Column(Text, nullable=True)
+    # "google" for Gmail OAuth
+    oauth_provider = Column(String, nullable=True)
+
+    # OAuth tokens (often encrypted at rest by service code)
+    oauth_access_token = Column(Text, nullable=True)
+    oauth_refresh_token = Column(Text, nullable=True)
+    oauth_expires_at = Column(DateTime, nullable=True)
+
+    # Optional IMAP/SMTP configuration for non-Gmail providers
+    imap_host = Column(String, nullable=True)
+    imap_port = Column(Integer, nullable=True)
+    imap_ssl = Column(Boolean, nullable=True)
+    smtp_host = Column(String, nullable=True)
+    smtp_port = Column(Integer, nullable=True)
+    smtp_ssl = Column(Boolean, nullable=True)
+    username = Column(String, nullable=True)
+    password_enc = Column(Text, nullable=True)
 
     email_address = Column(String, nullable=False)
     display_name = Column(String, nullable=True)
+
+    is_primary = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -137,6 +154,7 @@ class CallerMemoryEvent(Base):
 
     Used by the Control Plane for admin/debug tooling only.
     """
+
     __tablename__ = "caller_memory_events"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid4()))
