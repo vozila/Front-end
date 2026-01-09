@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import or_
+from sqlalchemy import or_, cast, String
 from sqlalchemy.orm import Session
 
 from deps import get_db
@@ -81,9 +81,9 @@ def build_memory_router(require_admin_key) -> APIRouter:
         query = db.query(CallerMemoryEvent)
 
         if tenant_id:
-            query = query.filter(CallerMemoryEvent.tenant_id == tenant_id)
+            query = query.filter(cast(CallerMemoryEvent.tenant_id, String) == tenant_id)
         if caller_id:
-            query = query.filter(CallerMemoryEvent.caller_id == caller_id)
+            query = query.filter(cast(CallerMemoryEvent.caller_id, String) == caller_id)
         if call_sid:
             query = query.filter(CallerMemoryEvent.call_sid == call_sid)
         if skill_key:
@@ -95,17 +95,19 @@ def build_memory_router(require_admin_key) -> APIRouter:
             q_str = (q or "").strip()
             if q_str:
                 like = f"%{q_str}%"
+                # NOTE: tenant_id / caller_id are UUID in the DB. ILIKE on UUID fails unless cast.
                 query = query.filter(
                     or_(
                         CallerMemoryEvent.text.ilike(like),
                         CallerMemoryEvent.skill_key.ilike(like),
-                        CallerMemoryEvent.caller_id.ilike(like),
                         CallerMemoryEvent.call_sid.ilike(like),
                         CallerMemoryEvent.kind.ilike(like),
-                        CallerMemoryEvent.tenant_id.ilike(like),
+                        cast(CallerMemoryEvent.tenant_id, String).ilike(like),
+                        cast(CallerMemoryEvent.caller_id, String).ilike(like),
+                        # id is usually UUID too; casting keeps search robust across schema versions
+                        cast(CallerMemoryEvent.id, String).ilike(like),
                     )
                 )
-
         query = query.order_by(CallerMemoryEvent.created_at.desc())
 
         rows = query.offset(offset).limit(limit + 1).all()
