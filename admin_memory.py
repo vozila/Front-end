@@ -18,7 +18,7 @@ Notes:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -55,8 +55,11 @@ class LongTermMemoryRowOut(BaseModel):
     skill_key: str
     text: str
 
-    data_json: Optional[Dict[str, Any]] = None
-    tags_json: Optional[Dict[str, Any]] = None
+    # NOTE: These columns may contain either JSON objects OR JSON arrays depending on
+    # historical writes. This is an admin/debug endpoint, so we keep it permissive
+    # to avoid 500s when encountering mixed shapes.
+    data_json: Optional[Any] = None
+    tags_json: Optional[Any] = None
 
 
 class LongTermMemoryListOut(BaseModel):
