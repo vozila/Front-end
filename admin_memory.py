@@ -55,9 +55,10 @@ class LongTermMemoryRowOut(BaseModel):
     skill_key: str
     text: str
 
-    # NOTE: These columns may contain either JSON objects OR JSON arrays depending on
-    # historical writes. This is an admin/debug endpoint, so we keep it permissive
-    # to avoid 500s when encountering mixed shapes.
+    # IMPORTANT:
+    # Historical rows may store JSON as either an object OR an array.
+    # Example from prod: tags_json = ["skill:call_summary"].
+    # This is an admin/debug endpoint, so we keep these flexible to avoid 500s.
     data_json: Optional[Any] = None
     tags_json: Optional[Any] = None
 
