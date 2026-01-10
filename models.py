@@ -186,3 +186,45 @@ Index(
     CallerMemoryEvent.skill_key,
     CallerMemoryEvent.created_at.desc(),
 )
+
+# =========================
+# KB Files (Phase 1)
+# =========================
+
+class KBFile(Base):
+    """Tenant-uploaded knowledge/policy files.
+
+    IMPORTANT:
+    - Large blobs are stored in object storage (S3/R2/etc).
+    - Postgres stores only metadata + storage key references.
+    - tenant_id is a *string* to match existing caller_memory_events schema.
+    """
+
+    __tablename__ = "kb_files"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+
+    tenant_id = Column(String, index=True, nullable=False)
+
+    # "knowledge" | "policy" (kept as string for migration simplicity)
+    kind = Column(String, index=True, nullable=False, default="knowledge")
+
+    # "uploaded" for now; reserved for Phase 2 ("ingesting", "ready", "failed")
+    status = Column(String, index=True, nullable=False, default="uploaded")
+
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
+    sha256 = Column(String, nullable=True)
+
+    storage_bucket = Column(String, nullable=False)
+    storage_key = Column(String, nullable=False)
+
+    uploaded_by = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+
+
+Index("ix_kb_files_tenant_created", KBFile.tenant_id, KBFile.created_at.desc())
+Index("ix_kb_files_tenant_filename", KBFile.tenant_id, KBFile.filename)
+
