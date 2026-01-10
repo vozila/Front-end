@@ -18,7 +18,7 @@ Notes:
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -55,10 +55,6 @@ class LongTermMemoryRowOut(BaseModel):
     skill_key: str
     text: str
 
-    # IMPORTANT:
-    # Historical rows may store JSON as either an object OR an array.
-    # Example from prod: tags_json = ["skill:call_summary"].
-    # This is an admin/debug endpoint, so we keep these flexible to avoid 500s.
     data_json: Optional[Any] = None
     tags_json: Optional[Any] = None
 
