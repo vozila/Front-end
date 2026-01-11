@@ -38,7 +38,7 @@ class KbIngestJob(Base):
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
 
     tenant_id = Column(PGUUID(as_uuid=True), nullable=False, index=True)
-    file_id = Column(PGUUID(as_uuid=True), ForeignKey("kb_files.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_id = Column(String, ForeignKey("kb_files.id", ondelete="CASCADE"), nullable=False, index=True)
 
     # queued | running | ready | failed
     status = Column(String(24), nullable=False, default="queued", index=True)
@@ -60,7 +60,7 @@ class KbChunk(Base):
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
 
     tenant_id = Column(PGUUID(as_uuid=True), nullable=False, index=True)
-    file_id = Column(PGUUID(as_uuid=True), ForeignKey("kb_files.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_id = Column(String, ForeignKey("kb_files.id", ondelete="CASCADE"), nullable=False, index=True)
 
     # Copy file kind ("knowledge" | "policy") for convenience at retrieval time
     kind = Column(String(24), nullable=False, default="knowledge", index=True)
@@ -193,7 +193,7 @@ def register_kb_ingest_routes(
                 db.query(KbIngestJob)
                 .filter(
                     KbIngestJob.tenant_id == tenant_uuid,
-                    KbIngestJob.file_id == file_uuid,
+                    KbIngestJob.file_id == str(file_uuid),
                     KbIngestJob.status.in_(["queued", "running"]),
                 )
                 .order_by(KbIngestJob.created_at.desc())
@@ -205,7 +205,7 @@ def register_kb_ingest_routes(
         job = KbIngestJob(
             id=uuid4(),
             tenant_id=tenant_uuid,
-            file_id=file_uuid,
+            file_id=str(file_uuid),
             status="queued",
             created_at=datetime.now(timezone.utc),
         )
@@ -265,7 +265,7 @@ def register_kb_ingest_routes(
 
         job = (
             db.query(KbIngestJob)
-            .filter(KbIngestJob.tenant_id == tenant_uuid, KbIngestJob.file_id == file_uuid)
+            .filter(KbIngestJob.tenant_id == tenant_uuid, KbIngestJob.file_id == str(file_uuid))
             .order_by(KbIngestJob.created_at.desc())
             .first()
         )
