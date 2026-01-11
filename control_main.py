@@ -100,10 +100,13 @@ def require_admin_key(
 app = FastAPI(title="Vozlia Control")
 
 if os.getenv("KB_INGEST_ENABLED", "0") == "1":
-    register_kb_ingest_routes(app, require_admin=require_admin_key, get_db=get_db)
-
-
-
+    try:
+        from kb_ingest import register_kb_ingest_routes
+        register_kb_ingest_routes(app, require_admin=require_admin_key, get_db=get_db)
+        logger.info("KB ingest routes registered")
+    except Exception:
+        # Fail-open: Control Plane should still boot even if ingest is misconfigured
+        logger.exception("KB ingest routes failed to register; ingestion endpoints disabled")
 
 # Admin Memory (long-term memory table + delete) for WebUI debugging
 app.include_router(build_memory_router(require_admin_key))
