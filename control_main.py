@@ -63,7 +63,6 @@ from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, R
 
 from models import EmailAccount
 from admin_memory import build_memory_router
-from kb_ingest import register_kb_ingest_routes
 
 
 
@@ -101,7 +100,6 @@ def require_admin_key(
 app = FastAPI(title="Vozlia Control")
 
 if os.getenv("KB_INGEST_ENABLED", "0") == "1":
-    from kb_ingest import register_kb_ingest_routes
     register_kb_ingest_routes(app, require_admin=require_admin_key, get_db=get_db)
 
 
