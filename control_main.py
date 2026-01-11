@@ -33,8 +33,6 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from starlette.middleware.cors import CORSMiddleware
-
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
 
@@ -65,7 +63,8 @@ from services.render_api import render_get_json, ms_to_rfc3339, rfc3339_to_ms, R
 
 from models import EmailAccount
 from admin_memory import build_memory_router
-from admin_kb_files import build_kb_router
+from kb_ingest import register_kb_ingest_routes
+
 
 
 
@@ -100,30 +99,11 @@ def require_admin_key(
 # =========================
 
 app = FastAPI(title="Vozlia Control")
+register_kb_ingest_routes(app, require_admin=require_admin, get_db=get_db)
 
-# Optional CORS for browser -> Control Plane KB upload/download (token-auth).
-# Set CONTROL_CORS_ORIGINS to a comma-separated list (e.g. https://your-admin.vercel.app)
-# Or set CONTROL_CORS_ORIGIN_REGEX for preview deployments (e.g. r"https://.*\.vercel\.app").
-CORS_ORIGINS = [o.strip() for o in os.getenv("CONTROL_CORS_ORIGINS", "").split(",") if o.strip()]
-CORS_ORIGIN_REGEX = (os.getenv("CONTROL_CORS_ORIGIN_REGEX") or "").strip() or None
-if CORS_ORIGINS or CORS_ORIGIN_REGEX:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=CORS_ORIGINS,
-        allow_origin_regex=CORS_ORIGIN_REGEX,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["Content-Disposition"],
-        max_age=600,
-    )
 
 # Admin Memory (long-term memory table + delete) for WebUI debugging
 app.include_router(build_memory_router(require_admin_key))
-
-# KB Files (Phase 1): upload/list/download/delete (multi-tenant + object storage)
-app.include_router(build_kb_router(require_admin_key))
-
 
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
