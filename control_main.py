@@ -99,7 +99,12 @@ def require_admin_key(
 # =========================
 
 app = FastAPI(title="Vozlia Control")
-register_kb_ingest_routes(app, require_admin=require_admin, get_db=get_db)
+
+if os.getenv("KB_INGEST_ENABLED", "0") == "1":
+    from kb_ingest import register_kb_ingest_routes
+    register_kb_ingest_routes(app, require_admin=require_admin_key, get_db=get_db)
+
+
 
 
 # Admin Memory (long-term memory table + delete) for WebUI debugging
