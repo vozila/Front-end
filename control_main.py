@@ -32,6 +32,8 @@ DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
@@ -99,6 +101,41 @@ def require_admin_key(
 
 app = FastAPI(title="Vozlia Control")
 
+# -------------------------
+# CORS (needed for browser -> Control Plane uploads via /kb/upload)
+# -------------------------
+CONTROL_CORS_ORIGIN_REGEX = os.getenv("CONTROL_CORS_ORIGIN_REGEX", "").strip()
+if (CONTROL_CORS_ORIGIN_REGEX.startswith('"') and CONTROL_CORS_ORIGIN_REGEX.endswith('"')) or (
+    CONTROL_CORS_ORIGIN_REGEX.startswith("'") and CONTROL_CORS_ORIGIN_REGEX.endswith("'")
+):
+    CONTROL_CORS_ORIGIN_REGEX = CONTROL_CORS_ORIGIN_REGEX[1:-1].strip()
+
+if CONTROL_CORS_ORIGIN_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=CONTROL_CORS_ORIGIN_REGEX,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Vozlia-Trace"],
+        max_age=600,
+    )
+
+# -------------------------
+# KB Phase 1: File management routes (list/upload-token/upload/download/delete)
+# -------------------------
+if os.getenv("KB_FILES_ENABLED", "1") == "1":
+    try:
+        from admin_kb_files import build_kb_router
+        app.include_router(build_kb_router(require_admin_key))
+        logger.info("KB file routes registered")
+    except Exception:
+        # Fail-open: keep control plane online, but make it very obvious uploads will 404
+        logger.exception("KB file routes failed to register; upload/list endpoints disabled")
+
+# -------------------------
+# KB Phase 2: ingestion routes (enqueue/status/jobs)
+# -------------------------
 if os.getenv("KB_INGEST_ENABLED", "0") == "1":
     try:
         from kb_ingest import register_kb_ingest_routes
@@ -110,6 +147,7 @@ if os.getenv("KB_INGEST_ENABLED", "0") == "1":
 
 # Admin Memory (long-term memory table + delete) for WebUI debugging
 app.include_router(build_memory_router(require_admin_key))
+
 
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
