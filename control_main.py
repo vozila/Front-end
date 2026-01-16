@@ -37,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
+from sqlalchemy import text
 
 from deps import get_db
 from db import Base, engine
@@ -149,6 +150,184 @@ if os.getenv("KB_INGEST_ENABLED", "0") == "1":
 app.include_router(build_memory_router(require_admin_key))
 
 
+
+# -------------------------
+# KB Guardrails: /admin/kb/health + optional startup selfcheck
+# -------------------------
+
+_KB_EXPECTED_FILE_ROUTES = [
+    ("/admin/kb/files", "GET"),
+    ("/admin/kb/files/upload-token", "POST"),
+    ("/admin/kb/files/{file_id}", "GET"),
+    ("/admin/kb/files/{file_id}", "DELETE"),
+    ("/admin/kb/files/{file_id}/download-token", "GET"),
+    ("/admin/kb/files/{file_id}/download", "GET"),
+    ("/kb/upload", "POST"),
+    ("/kb/download", "GET"),
+]
+
+_KB_EXPECTED_INGEST_ROUTES = [
+    ("/admin/kb/files/{file_id}/ingest", "POST"),
+    ("/admin/kb/files/{file_id}/ingest-status", "GET"),
+    ("/admin/kb/ingest-jobs", "GET"),
+]
+
+
+def _kb_route_map() -> Dict[str, set]:
+    out: Dict[str, set] = {}
+    for r in app.router.routes:
+        path = getattr(r, "path", "") or ""
+        if not path:
+            continue
+        methods = set(getattr(r, "methods", None) or [])
+        out.setdefault(path, set()).update(methods)
+    return out
+
+
+def _kb_missing(expected: List[tuple]) -> List[str]:
+    routes = _kb_route_map()
+    missing: List[str] = []
+    for path, method in expected:
+        ms = routes.get(path, set())
+        if method not in ms:
+            missing.append(f"{method} {path}")
+    return missing
+
+
+def _kb_env_is_1(name: str, default: str = "0") -> bool:
+    return (os.getenv(name, default) or "").strip() == "1"
+
+
+class KbHealthOut(BaseModel):
+    ok: bool = True
+
+    kb_files_enabled: bool = True
+    kb_ingest_enabled: bool = False
+
+    routes: Dict[str, Any] = Field(default_factory=dict)
+    storage: Dict[str, Any] = Field(default_factory=dict)
+    db: Dict[str, Any] = Field(default_factory=dict)
+    worker: Dict[str, Any] = Field(default_factory=dict)
+
+    now_utc: str = Field(default_factory=lambda: dt.datetime.now(dt.timezone.utc).isoformat())
+
+
+@app.get("/admin/kb/health", response_model=KbHealthOut)
+def kb_health(
+    _admin_ok: bool = Depends(require_admin_key),
+    db: Session = Depends(get_db),
+) -> KbHealthOut:
+    files_enabled = os.getenv("KB_FILES_ENABLED", "1") == "1"
+    ingest_enabled = os.getenv("KB_INGEST_ENABLED", "0") == "1"
+
+    missing_file = _kb_missing(_KB_EXPECTED_FILE_ROUTES) if files_enabled else []
+    missing_ingest = _kb_missing(_KB_EXPECTED_INGEST_ROUTES) if ingest_enabled else []
+
+    # Storage config booleans (never return actual secrets)
+    storage = {
+        "bucket_set": bool((os.getenv("KB_S3_BUCKET", "") or "").strip()),
+        "prefix_set": bool((os.getenv("KB_S3_PREFIX", "") or "").strip()),
+        "endpoint_set": bool((os.getenv("KB_S3_ENDPOINT_URL", "") or "").strip()),
+        "region_set": bool((os.getenv("KB_S3_REGION", "") or "").strip()),
+        "access_key_set": bool((os.getenv("KB_S3_ACCESS_KEY_ID", "") or "").strip()),
+        "secret_key_set": bool((os.getenv("KB_S3_SECRET_ACCESS_KEY", "") or "").strip()),
+        "kb_token_secret_set": bool((os.getenv("KB_TOKEN_SECRET", "") or "").strip()),
+    }
+    storage_required_ok = (
+        storage["bucket_set"]
+        and storage["prefix_set"]
+        and storage["access_key_set"]
+        and storage["secret_key_set"]
+        and storage["kb_token_secret_set"]
+    )
+
+    # DB table existence
+    def table_exists(name: str) -> bool:
+        try:
+            val = db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{name}"}).scalar()
+            return val is not None
+        except Exception:
+            return False
+
+    db_state = {
+        "kb_files_table": table_exists("kb_files"),
+        "kb_ingest_jobs_table": table_exists("kb_ingest_jobs"),
+        "kb_chunks_table": table_exists("kb_chunks"),
+        "kb_worker_heartbeat_table": table_exists("kb_worker_heartbeat"),
+    }
+
+    # Worker heartbeat (best-effort)
+    worker_state: Dict[str, Any] = {"heartbeat_ok": None, "last_heartbeat_utc": None, "age_s": None}
+    if db_state["kb_worker_heartbeat_table"]:
+        try:
+            row = db.execute(text("SELECT MAX(updated_at) FROM kb_worker_heartbeat")).scalar()
+            if row is not None:
+                now = dt.datetime.now(dt.timezone.utc)
+                if getattr(row, "tzinfo", None) is None:
+                    row = row.replace(tzinfo=dt.timezone.utc)
+                age_s = (now - row).total_seconds()
+                max_age = int(os.getenv("KB_WORKER_HEARTBEAT_MAX_AGE_S", "60") or "60")
+                worker_state = {
+                    "heartbeat_ok": age_s <= max_age,
+                    "last_heartbeat_utc": row.isoformat(),
+                    "age_s": round(age_s, 2),
+                    "max_age_s": max_age,
+                }
+        except Exception:
+            pass
+
+    ok = True
+    if files_enabled and missing_file:
+        ok = False
+    if ingest_enabled and missing_ingest:
+        ok = False
+
+    # Config sanity: if KB files are enabled, storage + token secret should be set
+    if files_enabled and not storage_required_ok:
+        ok = False
+
+    # If ingest is enabled, the job/chunk tables should exist
+    if ingest_enabled and (not db_state["kb_ingest_jobs_table"] or not db_state["kb_chunks_table"]):
+        ok = False
+
+    # Optionally require ingest worker heartbeat when ingest is enabled
+    if ingest_enabled and _kb_env_is_1("KB_REQUIRE_INGEST_WORKER", "0"):
+        if worker_state.get("heartbeat_ok") is not True:
+            ok = False
+
+    return KbHealthOut(
+        ok=ok,
+        kb_files_enabled=files_enabled,
+        kb_ingest_enabled=ingest_enabled,
+        routes={"file_missing": missing_file, "ingest_missing": missing_ingest},
+        storage={**storage, "required_ok": storage_required_ok},
+        db=db_state,
+        worker=worker_state,
+    )
+
+
+def _kb_startup_selfcheck() -> None:
+    """Optional hard guardrail: fail deploy if expected KB routes are missing."""
+    files_enabled = os.getenv("KB_FILES_ENABLED", "1") == "1"
+    ingest_enabled = os.getenv("KB_INGEST_ENABLED", "0") == "1"
+
+    missing_file = _kb_missing(_KB_EXPECTED_FILE_ROUTES) if files_enabled else []
+    missing_ingest = _kb_missing(_KB_EXPECTED_INGEST_ROUTES) if ingest_enabled else []
+
+    require_files = _kb_env_is_1("KB_REQUIRE_FILE_ROUTES", "0")
+    require_ingest = _kb_env_is_1("KB_REQUIRE_INGEST_ROUTES", "0")
+
+    if missing_file:
+        logger.error("KB file routes missing (uploads/list will 404): %s", missing_file)
+    if missing_ingest and ingest_enabled:
+        logger.warning("KB ingest routes missing: %s", missing_ingest)
+
+    if require_files and missing_file:
+        raise RuntimeError(f"KB file routes missing: {missing_file}")
+    if require_ingest and missing_ingest:
+        raise RuntimeError(f"KB ingest routes missing: {missing_ingest}")
+
+
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
     trace = request.headers.get("x-vozlia-trace") or request.headers.get("X-Vozlia-Trace")
@@ -177,6 +356,14 @@ async def trace_middleware(request: Request, call_next):
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+
+    # Optional: fail deploy if expected KB routes are missing
+    try:
+        _kb_startup_selfcheck()
+    except Exception:
+        logger.exception("KB startup selfcheck failed")
+        if _kb_env_is_1("KB_REQUIRE_FILE_ROUTES", "0") or _kb_env_is_1("KB_REQUIRE_INGEST_ROUTES", "0"):
+            raise
 
 
 @app.get("/health")
