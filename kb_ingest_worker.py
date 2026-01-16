@@ -180,6 +180,29 @@ WHERE id::text = :job_id;
 )
 
 
+
+# ----------------------------
+# Worker heartbeat (optional)
+# ----------------------------
+
+HEARTBEAT_CREATE_SQL = text(
+    """
+CREATE TABLE IF NOT EXISTS kb_worker_heartbeat (
+  id TEXT PRIMARY KEY,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+)
+
+HEARTBEAT_UPSERT_SQL = text(
+    """
+INSERT INTO kb_worker_heartbeat (id, updated_at)
+VALUES (:id, NOW())
+ON CONFLICT (id) DO UPDATE SET updated_at = EXCLUDED.updated_at;
+"""
+)
+
+
 # ----------------------------
 # S3/R2 client
 # ----------------------------
@@ -374,6 +397,34 @@ def _make_engine() -> Engine:
     return create_engine(db_url, pool_pre_ping=True, future=True)
 
 
+
+def _ensure_heartbeat_table(engine: Engine) -> None:
+    """Create heartbeat table if missing (safe to call repeatedly)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(HEARTBEAT_CREATE_SQL)
+    except Exception as e:
+        log.warning("heartbeat table create failed: %s", e)
+
+
+def _heartbeat(engine: Engine, worker_id: str) -> None:
+    """Update worker heartbeat timestamp (best-effort)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(HEARTBEAT_UPSERT_SQL, {"id": worker_id})
+    except Exception as e:
+        log.warning("heartbeat upsert failed: %s", e)
+
+
+def _resolve_worker_id() -> str:
+    return (
+        _env_str("KB_WORKER_ID", "").strip()
+        or _env_str("RENDER_INSTANCE_ID", "").strip()
+        or _env_str("HOSTNAME", "").strip()
+        or f"kb-worker-{os.getpid()}"
+    )
+
+
 def _claim_next_job(engine: Engine) -> Optional[JobRow]:
     with engine.begin() as conn:
         row = conn.execute(CLAIM_NEXT_JOB_SQL).mappings().first()
@@ -464,11 +515,24 @@ def main() -> None:
     engine = _make_engine()
     s3 = _build_s3_client()
 
+    worker_id = _resolve_worker_id()
+    heartbeat_every_s = _env_int("KB_WORKER_HEARTBEAT_EVERY_S", 20)
+
+    _ensure_heartbeat_table(engine)
+    _heartbeat(engine, worker_id)
+    last_hb = time.monotonic()
+
     log.info("KB worker started (poll=%ss, once=%s, drain=%s)", poll_s, once, drain)
 
     processed_any = False
 
     while True:
+        # Heartbeat (so /admin/kb/health can detect worker liveness)
+        now = time.monotonic()
+        if heartbeat_every_s > 0 and (now - last_hb) >= heartbeat_every_s:
+            _heartbeat(engine, worker_id)
+            last_hb = now
+
         job = _claim_next_job(engine)
         if not job:
             if once:
