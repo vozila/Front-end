@@ -150,6 +150,17 @@ if os.getenv("KB_INGEST_ENABLED", "0") == "1":
 app.include_router(build_memory_router(require_admin_key))
 
 
+# -------------------------
+# KB Phase 3: Q&A/query routes (retrieve chunks + optional LLM answer)
+# -------------------------
+if os.getenv("KB_QA_ENABLED", "1") == "1":
+    try:
+        from kb_query import register_kb_query_routes
+        register_kb_query_routes(app, require_admin=require_admin_key, get_db=get_db)
+        logger.info("KB query routes registered")
+    except Exception:
+        # Fail-open: keep control plane online, but make it obvious KB Q&A will 404/503
+        logger.exception("KB query routes failed to register; KB Q&A endpoint disabled")
 
 # -------------------------
 # KB Guardrails: /admin/kb/health + optional startup selfcheck
