@@ -256,6 +256,22 @@ def _norm_tokens(s: str) -> List[str]:
     return toks
 
 
+
+def _looks_like_save_prompt(text: str) -> bool:
+    t = _normalize(text)
+    # Keep this fuzzy; UI copy may change.
+    return ("save this as a skill" in t) or ("save as a skill" in t) or ("save it as a skill" in t)
+
+
+def _is_affirmative(text: str) -> bool:
+    t = _normalize(text)
+    return t in ("y", "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please do", "do it", "save it", "save")
+
+
+def _is_negative(text: str) -> bool:
+    t = _normalize(text)
+    return t in ("n", "no", "nope", "nah", "not now", "no thanks", "no thank you", "dont", "don't", "do not", "don't save", "dont save", "skip")
+
 def _resolve_skill_id_from_name(name: str, skills_config: Dict[str, Any]) -> Optional[str]:
     n = _normalize(name)
     # exact skill_id
@@ -310,6 +326,233 @@ def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
             return json.loads(m.group(0))
         except Exception:
             return None
+
+
+
+
+_AGG_EXPR_RE = re.compile(r"^(count_distinct|count|sum|avg|min|max)\(\s*(\*|[A-Za-z0-9_]+)?\s*\)$", re.IGNORECASE)
+
+
+def _coerce_time_preset(preset: Any) -> Any:
+    if not isinstance(preset, str):
+        return preset
+    t = _normalize(preset).replace("-", "_").replace(" ", "_")
+    # Common variants
+    mapping = {
+        "thisweek": "this_week",
+        "this_week": "this_week",
+        "current_week": "this_week",
+        "lastweek": "last_week",
+        "last_week": "last_week",
+        "thismonth": "this_month",
+        "this_month": "this_month",
+        "last7days": "last_7_days",
+        "last_7_days": "last_7_days",
+        "last30days": "last_30_days",
+        "last_30_days": "last_30_days",
+        "yesterday": "yesterday",
+        "today": "today",
+    }
+    return mapping.get(t, t)
+
+
+def _coerce_filters(raw: Any) -> list[dict]:
+    if raw is None:
+        return []
+    out: list[dict] = []
+
+    # Dict form: {"kind":"turn"} => eq filters
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k and v is not None:
+                out.append({"field": str(k), "op": "eq", "value": v})
+        return out
+
+    if not isinstance(raw, list):
+        return []
+
+    for item in raw:
+        if item is None:
+            continue
+
+        # String shortcuts: "kind=turn"
+        if isinstance(item, str):
+            s = item.strip()
+            m = re.match(r"^([A-Za-z0-9_\.]+)\s*(=|:|!=|>=|<=|>|<)\s*(.+)$", s)
+            if m:
+                field = m.group(1)
+                op_sym = m.group(2)
+                val = m.group(3).strip().strip('"').strip("'")
+                sym2op = {
+                    "=": "eq",
+                    ":": "eq",
+                    "!=": "ne",
+                    ">": "gt",
+                    "<": "lt",
+                    ">=": "gte",
+                    "<=": "lte",
+                }
+                out.append({"field": field, "op": sym2op.get(op_sym, "eq"), "value": val})
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        # Already in correct-ish shape
+        if "field" in item and "op" in item:
+            d = dict(item)
+            # normalize a few common alias keys
+            if "as" in d and "as_name" not in d:
+                d["as_name"] = d.pop("as")
+            out.append(d)
+            continue
+
+        # Single-pair dict: {"kind":"turn"}
+        if len(item.keys()) == 1:
+            k = next(iter(item.keys()))
+            v = item.get(k)
+            out.append({"field": str(k), "op": "eq", "value": v})
+            continue
+
+        # Multi-key dict without explicit op: treat each key as eq
+        for k, v in item.items():
+            if k and v is not None:
+                out.append({"field": str(k), "op": "eq", "value": v})
+
+    return out
+
+
+def _parse_agg_expr(expr: Any) -> tuple[str, str | None] | None:
+    if not isinstance(expr, str):
+        return None
+    s = expr.strip()
+    m = _AGG_EXPR_RE.match(s)
+    if not m:
+        return None
+    op = m.group(1).lower()
+    field = (m.group(2) or "").strip() or None
+    if field == "*" or field == "":
+        field = None
+    return op, field
+
+
+def _coerce_aggs(raw: Any) -> list[dict] | None:
+    if raw is None:
+        return None
+
+    # Dict form: {"calls":"count_distinct(call_sid)"}
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    if not isinstance(raw, list):
+        return None
+
+    out: list[dict] = []
+    for item in raw:
+        if item is None:
+            continue
+
+        if isinstance(item, str):
+            parsed = _parse_agg_expr(item)
+            if parsed:
+                op, field = parsed
+                out.append({"op": op, "field": field, "as_name": None})
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        # Proper-ish format already
+        if "op" in item:
+            d = dict(item)
+            # normalize common aliases
+            if "as" in d and "as_name" not in d:
+                d["as_name"] = d.pop("as")
+            if "name" in d and "as_name" not in d:
+                d["as_name"] = d.pop("name")
+            out.append(d)
+            continue
+
+        # Single-key dict: {"calls":"count_distinct(call_sid)"}
+        if len(item.keys()) == 1:
+            alias = next(iter(item.keys()))
+            expr = item.get(alias)
+            parsed = _parse_agg_expr(expr)
+            if parsed:
+                op, field = parsed
+                out.append({"op": op, "field": field, "as_name": str(alias)})
+            continue
+
+        # Multi-key dict: {"calls":"count_distinct(call_sid)","unique_callers":"count_distinct(caller_id)"}
+        for alias, expr in item.items():
+            parsed = _parse_agg_expr(expr)
+            if parsed:
+                op, field = parsed
+                out.append({"op": op, "field": field, "as_name": str(alias)})
+
+    return out or None
+
+
+def _coerce_dbquery_spec_dict(spec: Any, *, default_tz: str) -> dict:
+    if not isinstance(spec, dict):
+        return {}
+    s = dict(spec)
+
+    # timeframe normalization
+    tf = s.get("timeframe")
+    if isinstance(tf, dict):
+        tf2 = dict(tf)
+        if "timezone" not in tf2 or not tf2.get("timezone"):
+            tf2["timezone"] = default_tz
+        if "preset" in tf2:
+            tf2["preset"] = _coerce_time_preset(tf2.get("preset"))
+        s["timeframe"] = tf2
+
+    # filters + aggregations normalization
+    s["filters"] = _coerce_filters(s.get("filters"))
+    aggs = _coerce_aggs(s.get("aggregations"))
+    if aggs is not None:
+        s["aggregations"] = aggs
+
+    # limit normalization
+    try:
+        if "limit" in s:
+            s["limit"] = int(s["limit"])
+    except Exception:
+        s["limit"] = 25
+
+    return s
+
+
+def _coerce_plan_dict(data: Any, *, default_tz: str) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    out = dict(data)
+    actions = out.get("actions")
+    if actions is None:
+        out["actions"] = []
+        return out
+    if not isinstance(actions, list):
+        out["actions"] = []
+        return out
+
+    fixed_actions: list[Any] = []
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        ad = dict(a)
+        t = ad.get("type")
+        if t in ("dbquery_run", "dbquery_skill_create"):
+            spec = ad.get("spec")
+            ad["spec"] = _coerce_dbquery_spec_dict(spec, default_tz=default_tz)
+            # If an entity key exists at the action level, propagate into spec
+            ent = ad.get("entity")
+            if isinstance(ent, str) and ent.strip() and isinstance(ad.get("spec"), dict):
+                ad["spec"]["entity"] = ent.strip()
+        fixed_actions.append(ad)
+
+    out["actions"] = fixed_actions
+    return out
 
 
 def _tz_from_text(text: str, default_tz: str) -> str:
@@ -498,6 +741,177 @@ def _fastpath_calls_count(payload: WizardTurnIn) -> Optional[WizardPlan]:
     )
 
 
+
+
+def _humanize_preset(preset: str) -> str:
+    p = (preset or "").strip()
+    mapping = {
+        "today": "Today",
+        "yesterday": "Yesterday",
+        "this_week": "This Week",
+        "last_week": "Last Week",
+        "this_month": "This Month",
+        "last_7_days": "Last 7 Days",
+        "last_30_days": "Last 30 Days",
+    }
+    return mapping.get(p, p.replace("_", " ").title() if p else "Recent")
+
+
+def _fastpath_save_followup(payload: WizardTurnIn, ctx: Dict[str, Any]) -> Optional[WizardPlan]:
+    """
+    Handles the common follow-up after the wizard asks:
+      "Want me to save this as a Skill ... ?"
+
+    Without this, a short user reply like "no" can trigger an LLM plan that
+    may be schema-invalid, leading to the "action plan didn’t match" error.
+
+    Behavior:
+      - If user says NO: acknowledge and do not save. If it looks like we never actually
+        returned the underlying answer (e.g., backend call failed), we re-run the last
+        question deterministically when possible.
+      - If user says YES: save a default skill immediately (MVP) and offer scheduling next.
+    """
+    if not payload.messages:
+        return None
+
+    user_msg = (payload.message or "").strip()
+    if not user_msg:
+        return None
+
+    if not (_is_affirmative(user_msg) or _is_negative(user_msg)):
+        return None
+
+    # Find the most recent assistant message that contained the "save as a Skill" prompt.
+    idx_save: int | None = None
+    save_text = ""
+    msgs = payload.messages
+    for i in range(len(msgs) - 1, -1, -1):
+        m = msgs[i] or {}
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and _looks_like_save_prompt(m.get("content") or ""):
+            idx_save = i
+            save_text = m.get("content") or ""
+            break
+    if idx_save is None:
+        return None
+
+    # Find the original user question that preceded the save prompt.
+    orig_q: str | None = None
+    for j in range(idx_save - 1, -1, -1):
+        m = msgs[j] or {}
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and (m.get("content") or "").strip():
+            orig_q = (m.get("content") or "").strip()
+            break
+
+    # Heuristic: if the assistant message already contained an answer (numbers / "here's what I found"),
+    # then a "no" should just decline saving, without re-running.
+    save_norm = _normalize(save_text)
+    assistant_looked_like_answer = bool(re.search(r"\bhere['’]?s\b.*\bfound\b", save_norm)) or bool(re.search(r"\d", save_text))
+
+    if _is_negative(user_msg):
+        # If the answer seemed missing, attempt to re-run deterministically from the previous question.
+        if (not assistant_looked_like_answer) and orig_q:
+            # Try DB fastpaths first (calls/customers), else fall back to websearch.
+            tmp = WizardTurnIn(
+                message=orig_q,
+                default_timezone=payload.default_timezone,
+                default_channel=payload.default_channel,
+                default_destination=payload.default_destination,
+                dry_run=payload.dry_run,
+            )
+            p = _fastpath_calls_count(tmp)
+            if p and p.actions and isinstance(p.actions[0], ActionDBQueryRun):
+                spec = p.actions[0].spec
+                return WizardPlan(
+                    reply="Okay — here you go (not saving as a Skill).",
+                    actions=[
+                        ActionDBQueryRun(spec=spec, suggest_skill=False),
+                        ActionNoop(reason="declined_save_as_skill"),
+                    ],
+                )
+            # Best-effort fallback: treat as a websearch question.
+            return WizardPlan(
+                reply="Okay — here you go (not saving as a Skill).",
+                actions=[
+                    ActionWebSearchRun(query=orig_q, suggest_skill=False),
+                    ActionNoop(reason="declined_save_as_skill"),
+                ],
+            )
+
+        return WizardPlan(
+            reply="Okay — I won’t save this as a Skill. Anything else you’d like to set up?",
+            actions=[ActionNoop(reason="declined_save_as_skill")],
+        )
+
+    # YES path (MVP): save a default skill immediately.
+    if not orig_q:
+        return WizardPlan(
+            reply="Okay — what would you like to name this Skill?",
+            actions=[ActionNoop(reason="need_skill_name")],
+        )
+
+    # Prefer DB fastpath-derived spec when applicable.
+    tmp = WizardTurnIn(
+        message=orig_q,
+        default_timezone=payload.default_timezone,
+        default_channel=payload.default_channel,
+        default_destination=payload.default_destination,
+        dry_run=payload.dry_run,
+    )
+    p = _fastpath_calls_count(tmp)
+    if p and p.actions and isinstance(p.actions[0], ActionDBQueryRun):
+        # Derive a stable default name/triggers.
+        preset = "this_week"
+        tz = payload.default_timezone or DEFAULT_TIMEZONE
+        try:
+            if p.actions[0].spec.timeframe and p.actions[0].spec.timeframe.preset:
+                preset = str(p.actions[0].spec.timeframe.preset)
+            if p.actions[0].spec.timeframe and p.actions[0].spec.timeframe.timezone:
+                tz = str(p.actions[0].spec.timeframe.timezone)
+        except Exception:
+            pass
+
+        metric_unique = any(w in _normalize(orig_q) for w in ["customer", "customers", "caller", "callers", "unique"])
+        base_name = f"{'Unique Callers' if metric_unique else 'Calls'} {_humanize_preset(preset)}"
+        name = base_name.strip()
+        triggers = [orig_q]
+        # Add a short trigger variant
+        if metric_unique:
+            triggers.append(f"callers {preset.replace('_', ' ')}")
+        else:
+            triggers.append(f"calls {preset.replace('_', ' ')}")
+        # De-dupe
+        seen = set()
+        triggers2 = []
+        for t in triggers:
+            t2 = (t or '').strip()
+            if not t2:
+                continue
+            key = _normalize(t2)
+            if key in seen:
+                continue
+            seen.add(key)
+            triggers2.append(t2)
+
+        return WizardPlan(
+            reply=f"Saved. I created a Skill called '{name}'. Want to schedule it (time + timezone + delivery destination)?",
+            actions=[
+                ActionDBQuerySkillCreate(
+                    name=name,
+                    entity="caller_memory_events",
+                    spec=p.actions[0].spec,
+                    triggers=triggers2[:20],
+                )
+            ],
+        )
+
+    # Fallback: websearch skill
+    default_name = f"WebSearch: {orig_q[:48].strip()}" if len(orig_q) > 10 else f"WebSearch: {orig_q.strip()}"
+    return WizardPlan(
+        reply=f"Saved. I created a Skill called '{default_name}'. Want to schedule it (time + timezone + delivery destination)?",
+        actions=[ActionWebSearchSkillCreate(name=default_name, query=orig_q, triggers=[orig_q])],
+    )
+
+
 def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
     skills_config = get_skills_config(db, user)
     skills_priority = get_skills_priority_order(db, user)
@@ -637,14 +1051,27 @@ Allowed actions (choose 0+):
 8) noop:
    {{ \"type\":\"noop\", \"reason\":\"...\" }}
 
-DBQuery spec guidance:
+DBQuery spec guidance (STRICT JSON SHAPE):
 - Always choose an entity from the provided dbquery_entities context.
 - Only reference fields listed for that entity.
-- For call stats:
-  - entity=caller_memory_events
-  - filters include kind=turn
-  - calls ~= count_distinct(call_sid) where call_sid is not_null
-  - unique callers ~= count_distinct(caller_id)
+- filters MUST be a list of objects like:
+  [{{"field":"kind","op":"eq","value":"turn"}}, {{"field":"call_sid","op":"not_null"}}]
+- aggregations MUST be a list of objects like:
+  [{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}]
+- timeframe MUST be an object like:
+  {{"preset":"this_week","timezone":"America/New_York"}}
+
+Example (calls this week):
+{{ "type":"dbquery_run",
+  "spec":{{
+    "entity":"caller_memory_events",
+    "timeframe":{{"preset":"this_week","timezone":"America/New_York"}},
+    "filters":[{{"field":"kind","op":"eq","value":"turn"}},{{"field":"call_sid","op":"not_null"}}],
+    "aggregations":[{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}],
+    "limit":25
+  }},
+  "suggest_skill": true
+}}
 
 Known built-in skill aliases:
 - gmail_summary: \"email summaries\", \"gmail summary\"
@@ -701,8 +1128,20 @@ Return JSON shape:
 
     try:
         return WizardPlan.model_validate(data)
-    except ValidationError:
-        log.warning("CONFIG_WIZARD_PLAN_VALIDATION_FAIL data=%s", data)
+    except ValidationError as e:
+        # Attempt a deterministic "shape repair" for common dbquery spec mistakes
+        # (e.g., filters=[{"kind":"turn"}] or aggregations=[{"calls":"count_distinct(call_sid)"}]).
+        try:
+            fixed = _coerce_plan_dict(data, default_tz=default_tz)
+            if fixed and fixed != data:
+                try:
+                    return WizardPlan.model_validate(fixed)
+                except ValidationError:
+                    pass
+        except Exception:
+            pass
+
+        log.warning("CONFIG_WIZARD_PLAN_VALIDATION_FAIL data=%s err=%s", data, str(e))
         return WizardPlan(
             reply="I understood your request, but the action plan didn’t match the expected format. Please try again.",
             actions=[ActionNoop(reason="plan_schema_invalid")],
@@ -729,7 +1168,8 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
         payload.default_timezone = DEFAULT_TIMEZONE
 
     plan = (
-        _fastpath_schedule_websearch(payload, ctx)
+        _fastpath_save_followup(payload, ctx)
+        or _fastpath_schedule_websearch(payload, ctx)
         or _fastpath_calls_count(payload)
         or _plan_with_llm(payload, ctx)
     )
@@ -802,6 +1242,7 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                     executed.append({"type": "unknown_action"})
 
             except Exception as e:
+                log.exception("CONFIG_WIZARD_ACTION_EXEC_FAIL type=%s", getattr(action, "type", "action"))
                 executed.append({"type": getattr(action, "type", "action"), "error": str(e)})
 
     # If we executed a websearch_run/dbquery_run, prefer returning the backend-produced answer/summary.
@@ -837,6 +1278,19 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
         )
         if suggested and ("save" not in plan.reply.lower()) and ("skill" not in plan.reply.lower()):
             plan.reply = (plan.reply.rstrip() + "\n\nWant me to save this as a Skill you can trigger by name (and optionally schedule)?").strip()
+    except Exception:
+        pass
+
+
+    # If the user explicitly declined saving, make sure the response acknowledges that
+    # (even if the dbquery/websearch answer overwrote the earlier reply text).
+    try:
+        declined = any(
+            (getattr(a, "type", "") == "noop" and str(getattr(a, "reason", "") or "") == "declined_save_as_skill")
+            for a in plan.actions
+        )
+        if declined and ("won't save" not in plan.reply.lower()) and ("won’t save" not in plan.reply.lower()):
+            plan.reply = (plan.reply.rstrip() + "\n\nOkay — I won’t save this as a Skill.").strip()
     except Exception:
         pass
 
