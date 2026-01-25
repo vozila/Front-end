@@ -231,6 +231,17 @@ class WizardTurnOut(BaseModel):
 
 DEFAULT_TIMEZONE = "America/New_York"
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    v = (os.getenv(name, default) or default).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+# Workflow flag:
+# - When disabled (default), the wizard answers questions without asking "want to save as a skill?"
+#   The portal UI can still offer a "Save as skill" button.
+# - When enabled, the wizard may append a follow-up prompt to save/schedule.
+OFFER_SAVE_AFTER_QUERY = _env_flag("WIZARD_OFFER_SAVE_AFTER_QUERY", "0")
+
+
 _SKILL_ALIASES: Dict[str, List[str]] = {
     "gmail_summary": ["gmail summary", "email summaries", "email summary", "emails summary"],
     "investment_reporting": ["investment report", "investment reporting", "stock report", "stocks report", "stock reporting"],
@@ -737,7 +748,7 @@ def _fastpath_calls_count(payload: WizardTurnIn) -> Optional[WizardPlan]:
     reply = f"Okay — I'll check your {noun} for {preset.replace('_', ' ')} ({tz})."
     return WizardPlan(
         reply=reply,
-        actions=[ActionDBQueryRun(spec=spec, suggest_skill=True)],
+        actions=[ActionDBQueryRun(spec=spec, suggest_skill=OFFER_SAVE_AFTER_QUERY)],
     )
 
 
@@ -1036,6 +1047,7 @@ Allowed actions (choose 0+):
 
 4) dbquery_run:
    Use this when the owner asks about Vozlia's internal data (calls, customers, skills, schedules, KB docs, etc.).
+   "suggest_skill" should usually be false. Set it to true ONLY if the user explicitly asks to save/create a skill.
    {{ \"type\":\"dbquery_run\", \"spec\": {{ \"entity\":\"caller_memory_events\", \"filters\":[...], \"timeframe\":{{\"preset\":\"today\", \"timezone\":\"America/New_York\"}}, \"aggregations\":[...] }}, \"suggest_skill\": true }}
 
 5) dbquery_skill_create:
@@ -1070,7 +1082,7 @@ Example (calls this week):
     "aggregations":[{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}],
     "limit":25
   }},
-  "suggest_skill": true
+  "suggest_skill": false
 }}
 
 Known built-in skill aliases:
@@ -1270,29 +1282,31 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
     except Exception:
         pass
 
-    # If the plan suggested saving as a skill, add a gentle follow-up question.
-    try:
-        suggested = any(
-            (getattr(a, "type", "") in ("websearch_run", "dbquery_run") and bool(getattr(a, "suggest_skill", False)))
-            for a in plan.actions
-        )
-        if suggested and ("save" not in plan.reply.lower()) and ("skill" not in plan.reply.lower()):
-            plan.reply = (plan.reply.rstrip() + "\n\nWant me to save this as a Skill you can trigger by name (and optionally schedule)?").strip()
-    except Exception:
-        pass
+    # If enabled, the wizard may offer a follow-up to save the last query as a skill.
+    # Default is OFF to avoid interrupting normal Q&A; the UI can use the 'Save as Skill' button instead.
+    if OFFER_SAVE_AFTER_QUERY:
+        try:
+            suggested = any(
+                (getattr(a, "type", "") in ("websearch_run", "dbquery_run") and bool(getattr(a, "suggest_skill", False)))
+                for a in plan.actions
+            )
+            if suggested and ("save" not in plan.reply.lower()) and ("skill" not in plan.reply.lower()):
+                plan.reply = (plan.reply.rstrip() + "\n\nWant me to save this as a Skill you can trigger by name (and optionally schedule)?").strip()
+        except Exception:
+            pass
 
 
-    # If the user explicitly declined saving, make sure the response acknowledges that
-    # (even if the dbquery/websearch answer overwrote the earlier reply text).
-    try:
-        declined = any(
-            (getattr(a, "type", "") == "noop" and str(getattr(a, "reason", "") or "") == "declined_save_as_skill")
-            for a in plan.actions
-        )
-        if declined and ("won't save" not in plan.reply.lower()) and ("won’t save" not in plan.reply.lower()):
-            plan.reply = (plan.reply.rstrip() + "\n\nOkay — I won’t save this as a Skill.").strip()
-    except Exception:
-        pass
+    # Only acknowledge 'declined save' if the autosave-offer workflow is enabled.
+    if OFFER_SAVE_AFTER_QUERY:
+        try:
+            declined = any(
+                (getattr(a, "type", "") == "noop" and str(getattr(a, "reason", "") or "") == "declined_save_as_skill")
+                for a in plan.actions
+            )
+            if declined and ("won't save" not in plan.reply.lower()) and ("won’t save" not in plan.reply.lower()):
+                plan.reply = (plan.reply.rstrip() + "\n\nOkay — I won’t save this as a Skill.").strip()
+        except Exception:
+            pass
 
     # Return fresh state snapshots for the UI
     ctx2 = _build_context_snapshot(db, user, admin_key=admin_key)
