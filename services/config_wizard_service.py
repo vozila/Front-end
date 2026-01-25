@@ -239,7 +239,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
 # - When disabled (default), the wizard answers questions without asking "want to save as a skill?"
 #   The portal UI can still offer a "Save as skill" button.
 # - When enabled, the wizard may append a follow-up prompt to save/schedule.
-OFFER_SAVE_AFTER_QUERY = _env_flag("WIZARD_OFFER_SAVE_AFTER_QUERY", "0")
+OFFER_SAVE_AFTER_QUERY = False  # hard-disabled (use UI Save-as-Skill button)
+
+def _looks_like_metric_question(message: str) -> bool:
+    t = (message or "").strip().lower()
+    if not t:
+        return False
+    hints = ("how many", "number of", "how often", "times", "count", "most", "top", "least")
+    return any(h in t for h in hints)
 
 
 _SKILL_ALIASES: Dict[str, List[str]] = {
@@ -1179,10 +1186,27 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
     if not payload.default_timezone:
         payload.default_timezone = DEFAULT_TIMEZONE
 
+
+    # Deterministic metrics fast-path: for quantitative questions, bypass LLM planning and call backend metrics engine.
+    # This keeps portal troubleshooting aligned with voice metrics behavior (shared engine) and prevents numeric hallucinations.
+    if _looks_like_metric_question(payload.message) and not (("create" in payload.message.lower()) and ("skill" in payload.message.lower())):
+        tz = payload.default_timezone or DEFAULT_TIMEZONE
+        out = backend_post("/admin/metrics/run", admin_key=admin_key, json_body={"question": payload.message, "timezone": tz})
+        reply = out.get("spoken_summary") if isinstance(out, dict) else None
+        if not reply:
+            reply = "I can’t compute that metric yet from the current database."
+        return WizardTurnOut(
+            reply=reply,
+            actions_executed=[{"type": "metrics_run", "question": payload.message, "result": out}],
+            websearch_skills=ctx.get("websearch_skills", []),
+            websearch_schedules=ctx.get("websearch_schedules", []),
+            dbquery_skills=ctx.get("dbquery_skills", []),
+            dbquery_entities=ctx.get("dbquery_entities", {}),
+        )
+
     plan = (
         _fastpath_save_followup(payload, ctx)
         or _fastpath_schedule_websearch(payload, ctx)
-        or _fastpath_calls_count(payload)
         or _plan_with_llm(payload, ctx)
     )
 
