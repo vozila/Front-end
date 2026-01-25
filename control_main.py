@@ -17,8 +17,6 @@ import logging
 import time
 import random
 import urllib.error
-import urllib.parse
-import urllib.request
 import socket
 import datetime as dt
 from datetime import datetime, timedelta
@@ -33,10 +31,10 @@ DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
 
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, Body
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import text
@@ -46,6 +44,8 @@ from db import Base, engine
 from core.security import encrypt_str
 from models import EmailAccount
 from services.user_service import get_or_create_primary_user
+from services.backend_proxy import backend_get, backend_post, backend_delete
+from services.config_wizard_service import WizardTurnIn, WizardTurnOut, run_wizard_turn
 from services.settings_service import (
     get_agent_greeting,
     gmail_summary_enabled,
@@ -96,80 +96,6 @@ def require_admin_key(
             logger.warning("ADMIN_AUTH_FAIL trace=%s", (x_vozlia_trace or "").strip() or None)
         raise HTTPException(status_code=401, detail="Unauthorized")
     return True
-
-
-
-# =========================
-# BACKEND PROXY (WebSearch + Notify)
-# =========================
-
-def _backend_base_url() -> str:
-    base = (os.getenv("VOZLIA_BACKEND_BASE_URL") or os.getenv("VOZLIA_BACKEND_URL") or "").strip()
-    base = base.rstrip("/")
-    if not base:
-        raise HTTPException(status_code=500, detail="VOZLIA_BACKEND_BASE_URL not configured on control plane")
-    return base
-
-
-def _backend_admin_key() -> str:
-    # Allow separate backend admin key; fall back to this service's ADMIN_API_KEY
-    key = (os.getenv("BACKEND_ADMIN_API_KEY") or os.getenv("ADMIN_API_KEY") or "").strip()
-    if not key:
-        raise HTTPException(status_code=500, detail="BACKEND_ADMIN_API_KEY / ADMIN_API_KEY not configured for backend proxy")
-    return key
-
-
-def _media_type(ct: str | None) -> str:
-    if not ct:
-        return "application/json"
-    return ct.split(";")[0].strip() or "application/json"
-
-
-def _backend_request(
-    method: str,
-    path: str,
-    *,
-    query: dict[str, Any] | None = None,
-    json_body: Any | None = None,
-    timeout_s: float = 20.0,
-) -> tuple[int, str, bytes]:
-    if not path.startswith("/"):
-        path = "/" + path
-    url = _backend_base_url() + path
-    if query:
-        # Remove empties to avoid confusing upstream
-        cleaned = {k: v for k, v in query.items() if v is not None and str(v) != ""}
-        if cleaned:
-            url = url + "?" + urllib.parse.urlencode(cleaned, doseq=True)
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "vozlia-control-plane/1.0",
-        "X-Vozlia-Admin-Key": _backend_admin_key(),
-    }
-
-    data: bytes | None = None
-    if json_body is not None:
-        data = json.dumps(json_body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-
-    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read()
-            ct = resp.headers.get("content-type") or "application/json"
-            return int(getattr(resp, "status", 200) or 200), ct, body
-    except urllib.error.HTTPError as e:
-        body = e.read() if hasattr(e, "read") else b""
-        ct = (e.headers.get("content-type") if hasattr(e, "headers") else None) or "application/json"
-        return int(getattr(e, "code", 500) or 500), ct, body
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Backend proxy request failed: {e}") from None
-
-
-def _proxy(method: str, path: str, *, query: dict[str, Any] | None = None, json_body: Any | None = None) -> Response:
-    status, ct, body = _backend_request(method, path, query=query, json_body=json_body)
-    return Response(content=body, status_code=status, media_type=_media_type(ct))
 
 
 # =========================
@@ -1356,64 +1282,82 @@ def admin_render_logs_export(
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+# ============================================================
+# Backend proxy endpoints (notify + websearch)
+# ============================================================
+# These keep the Web UI isolated from the backend network surface.
+# The Web UI calls the control plane; the control plane calls the backend.
 
-
-
-# =========================
-# BACKEND PROXY ROUTES
-# (WebUI -> Control Plane -> Backend)
-# =========================
-
-# ---- Web Search admin proxy ----
-
-@app.post("/admin/websearch/search", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_search(payload: dict = Body(...)):
-    return _proxy("POST", "/admin/websearch/search", json_body=payload)
-
-
-@app.get("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_list_skills():
-    return _proxy("GET", "/admin/websearch/skills")
-
-
-@app.post("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_create_skill(payload: dict = Body(...)):
-    return _proxy("POST", "/admin/websearch/skills", json_body=payload)
-
-
-@app.delete("/admin/websearch/skills/{skill_id}", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_delete_skill(skill_id: str):
-    return _proxy("DELETE", f"/admin/websearch/skills/{skill_id}")
-
-
-@app.get("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_list_schedules():
-    return _proxy("GET", "/admin/websearch/schedules")
-
-
-@app.post("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
-def proxy_websearch_upsert_schedule(payload: dict = Body(...)):
-    return _proxy("POST", "/admin/websearch/schedules", json_body=payload)
-
-
-# ---- Notify proxy ----
-
-@app.post("/notify/sms", dependencies=[Depends(require_admin_key)])
-def proxy_notify_sms(payload: dict = Body(...)):
-    return _proxy("POST", "/notify/sms", json_body=payload)
-
-
-@app.post("/notify/whatsapp", dependencies=[Depends(require_admin_key)])
-def proxy_notify_whatsapp(payload: dict = Body(...)):
-    return _proxy("POST", "/notify/whatsapp", json_body=payload)
+def _backend_admin_key() -> str:
+    # We intentionally reuse ADMIN_API_KEY to avoid redundant env vars.
+    # If you want a distinct key, set VOZLIA_BACKEND_ADMIN_KEY and update backend_proxy.py accordingly.
+    return (os.getenv("ADMIN_API_KEY") or "").strip()
 
 
 @app.post("/notify/email", dependencies=[Depends(require_admin_key)])
-def proxy_notify_email(payload: dict = Body(...)):
-    return _proxy("POST", "/notify/email", json_body=payload)
+def proxy_notify_email(payload: dict):
+    return backend_post("/notify/email", admin_key=_backend_admin_key(), json_body=payload)
+
+
+@app.post("/notify/sms", dependencies=[Depends(require_admin_key)])
+def proxy_notify_sms(payload: dict):
+    return backend_post("/notify/sms", admin_key=_backend_admin_key(), json_body=payload)
+
+
+@app.post("/notify/whatsapp", dependencies=[Depends(require_admin_key)])
+def proxy_notify_whatsapp(payload: dict):
+    return backend_post("/notify/whatsapp", admin_key=_backend_admin_key(), json_body=payload)
 
 
 @app.post("/notify/call", dependencies=[Depends(require_admin_key)])
-def proxy_notify_call(payload: dict = Body(...)):
-    return _proxy("POST", "/notify/call", json_body=payload)
+def proxy_notify_call(payload: dict):
+    return backend_post("/notify/call", admin_key=_backend_admin_key(), json_body=payload)
 
+
+@app.get("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_skills_list():
+    return backend_get("/admin/websearch/skills", admin_key=_backend_admin_key())
+
+
+@app.post("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_skills_upsert(payload: dict):
+    return backend_post("/admin/websearch/skills", admin_key=_backend_admin_key(), json_body=payload)
+
+
+@app.delete("/admin/websearch/skills/{skill_id}", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_skills_delete(skill_id: str):
+    return backend_delete(f"/admin/websearch/skills/{skill_id}", admin_key=_backend_admin_key())
+
+
+@app.post("/admin/websearch/search", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_search(payload: dict):
+    return backend_post("/admin/websearch/search", admin_key=_backend_admin_key(), json_body=payload)
+
+
+@app.get("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_schedules_list():
+    return backend_get("/admin/websearch/schedules", admin_key=_backend_admin_key())
+
+
+@app.post("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_schedules_upsert(payload: dict):
+    return backend_post("/admin/websearch/schedules", admin_key=_backend_admin_key(), json_body=payload)
+
+
+@app.delete("/admin/websearch/schedules/{schedule_id}", dependencies=[Depends(require_admin_key)])
+def proxy_websearch_schedules_delete(schedule_id: str):
+    return backend_delete(f"/admin/websearch/schedules/{schedule_id}", admin_key=_backend_admin_key())
+
+
+# ============================================================
+# Configuration Wizard endpoint (ChatGPT-style console)
+# ============================================================
+
+@app.post("/admin/wizard/turn", response_model=WizardTurnOut, dependencies=[Depends(require_admin_key)])
+def admin_wizard_turn(payload: WizardTurnIn, db: Session = Depends(get_db)):
+    """
+    Chat-driven configuration endpoint.
+
+    The LLM proposes structured actions; the control plane validates and executes them.
+    """
+    return run_wizard_turn(db, payload, admin_key=_backend_admin_key())
