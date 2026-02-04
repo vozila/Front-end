@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import text
@@ -122,75 +122,6 @@ if CONTROL_CORS_ORIGIN_REGEX:
         allow_headers=["*"],
         expose_headers=["X-Vozlia-Trace"],
         max_age=600,
-    )
-
-# -------------------------
-# Optional HTTP diagnostics (admin + KB troubleshooting)
-# Enable with:
-#   CONTROL_HTTP_DIAG_ENABLED=1
-#   CONTROL_HTTP_DIAG_PREFIXES=/admin/concepts,/admin/kb
-#   CONTROL_HTTP_DIAG_LOG_BODY=1
-# -------------------------
-CONTROL_HTTP_DIAG_ENABLED = os.getenv("CONTROL_HTTP_DIAG_ENABLED", "0") == "1"
-CONTROL_HTTP_DIAG_PREFIXES = [p.strip() for p in os.getenv("CONTROL_HTTP_DIAG_PREFIXES", "").split(",") if p.strip()]
-CONTROL_HTTP_DIAG_LOG_BODY = os.getenv("CONTROL_HTTP_DIAG_LOG_BODY", "0") == "1"
-CONTROL_HTTP_DIAG_MAX_BODY_CHARS = int(os.getenv("CONTROL_HTTP_DIAG_MAX_BODY_CHARS", "2000") or "2000")
-
-if CONTROL_HTTP_DIAG_ENABLED and CONTROL_HTTP_DIAG_PREFIXES:
-    @app.middleware("http")
-    async def _control_http_diag(request: Request, call_next):
-        path = request.url.path
-        if not any(path.startswith(p) for p in CONTROL_HTTP_DIAG_PREFIXES):
-            return await call_next(request)
-
-        t0 = time.time()
-        body_preview = None
-        if CONTROL_HTTP_DIAG_LOG_BODY:
-            try:
-                b = await request.body()
-                body_preview = b.decode("utf-8", errors="replace")[:CONTROL_HTTP_DIAG_MAX_BODY_CHARS]
-            except Exception:
-                body_preview = None
-
-        try:
-            resp = await call_next(request)
-            ms = (time.time() - t0) * 1000.0
-            if resp.status_code >= 400:
-                logger.warning(
-                    "HTTP_DIAG method=%s path=%s status=%s ms=%.1f qs=%s body=%s",
-                    request.method,
-                    path,
-                    resp.status_code,
-                    ms,
-                    request.url.query,
-                    body_preview,
-                )
-            else:
-                logger.info(
-                    "HTTP_DIAG method=%s path=%s status=%s ms=%.1f",
-                    request.method,
-                    path,
-                    resp.status_code,
-                    ms,
-                )
-            return resp
-        except Exception:
-            ms = (time.time() - t0) * 1000.0
-            logger.exception(
-                "HTTP_DIAG_EXCEPTION method=%s path=%s ms=%.1f qs=%s body=%s",
-                request.method,
-                path,
-                ms,
-                request.url.query,
-                body_preview,
-            )
-            raise
-
-    logger.warning(
-        "CONTROL_HTTP_DIAG enabled prefixes=%s log_body=%s max_chars=%s",
-        CONTROL_HTTP_DIAG_PREFIXES,
-        CONTROL_HTTP_DIAG_LOG_BODY,
-        CONTROL_HTTP_DIAG_MAX_BODY_CHARS,
     )
 
 # -------------------------
@@ -1362,124 +1293,132 @@ def _backend_admin_key() -> str:
     # If you want a distinct key, set VOZLIA_BACKEND_ADMIN_KEY and update backend_proxy.py accordingly.
     return (os.getenv("ADMIN_API_KEY") or "").strip()
 
+def _proxy_call(fn):
+    """Run a backend proxy call and preserve backend status codes."""
+    try:
+        return fn()
+    except BackendProxyError as e:
+        logger.warning(
+            "BACKEND_PROXY_NON_2XX status=%s method=%s url=%s detail=%s",
+            e.status_code,
+            e.method,
+            e.url,
+            repr(e.detail),
+        )
+        content = e.detail if isinstance(e.detail, (dict, list)) else {"detail": str(e.detail)}
+        return JSONResponse(status_code=e.status_code, content=content)
+
+
 
 @app.post("/notify/email", dependencies=[Depends(require_admin_key)])
 def proxy_notify_email(payload: dict):
-    return backend_post("/notify/email", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/notify/email", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.post("/notify/sms", dependencies=[Depends(require_admin_key)])
 def proxy_notify_sms(payload: dict):
-    return backend_post("/notify/sms", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/notify/sms", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.post("/notify/whatsapp", dependencies=[Depends(require_admin_key)])
 def proxy_notify_whatsapp(payload: dict):
-    return backend_post("/notify/whatsapp", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/notify/whatsapp", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.post("/notify/call", dependencies=[Depends(require_admin_key)])
 def proxy_notify_call(payload: dict):
-    return backend_post("/notify/call", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/notify/call", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.get("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_skills_list():
-    return backend_get("/admin/websearch/skills", admin_key=_backend_admin_key())
+    return _proxy_call(lambda: backend_get("/admin/websearch/skills", admin_key=_backend_admin_key()))
 
 
 @app.post("/admin/websearch/skills", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_skills_upsert(payload: dict):
-    return backend_post("/admin/websearch/skills", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/admin/websearch/skills", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.delete("/admin/websearch/skills/{skill_id}", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_skills_delete(skill_id: str):
-    return backend_delete(f"/admin/websearch/skills/{skill_id}", admin_key=_backend_admin_key())
+    return _proxy_call(lambda: backend_delete(f"/admin/websearch/skills/{skill_id}", admin_key=_backend_admin_key()))
 
 
 @app.post("/admin/websearch/search", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_search(payload: dict):
-    return backend_post("/admin/websearch/search", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/admin/websearch/search", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.get("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_schedules_list():
-    return backend_get("/admin/websearch/schedules", admin_key=_backend_admin_key())
+    return _proxy_call(lambda: backend_get("/admin/websearch/schedules", admin_key=_backend_admin_key()))
 
 
 @app.post("/admin/websearch/schedules", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_schedules_upsert(payload: dict):
-    return backend_post("/admin/websearch/schedules", admin_key=_backend_admin_key(), json_body=payload)
+    return _proxy_call(lambda: backend_post("/admin/websearch/schedules", admin_key=_backend_admin_key(), json_body=payload))
 
 
 @app.delete("/admin/websearch/schedules/{schedule_id}", dependencies=[Depends(require_admin_key)])
 def proxy_websearch_schedules_delete(schedule_id: str):
-    return backend_delete(f"/admin/websearch/schedules/{schedule_id}", admin_key=_backend_admin_key())
+    return _proxy_call(lambda: backend_delete(f"/admin/websearch/schedules/{schedule_id}", admin_key=_backend_admin_key()))
 
 
 
-# -------------------------
-# Backend proxy endpoints (dbquery + concepts)
-# NOTE: The Portal WebUI talks to the control plane; these proxies reduce cross-service confusion.
-# -------------------------
 
-@app.get("/admin/dbquery/entities", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_entities():
-    return backend_get("/admin/dbquery/entities", admin_key=_backend_admin_key())
+# ============================================================
+# Proxy: Concepts (backend is source-of-truth)
+# ============================================================
 
-@app.post("/admin/dbquery/run", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_run(payload: dict):
-    return backend_post("/admin/dbquery/run", admin_key=_backend_admin_key(), json_body=payload)
+@app.get("/admin/concepts/definitions", dependencies=[Depends(require_admin_key)])
+def proxy_concepts_definitions_get():
+    return _proxy_call(lambda: backend_get("/admin/concepts/definitions", admin_key=_backend_admin_key()))
 
-@app.get("/admin/dbquery/skills", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_list_skills():
-    return backend_get("/admin/dbquery/skills", admin_key=_backend_admin_key())
-
-@app.post("/admin/dbquery/skills", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_create_skill(payload: dict):
-    return backend_post("/admin/dbquery/skills", admin_key=_backend_admin_key(), json_body=payload)
-
-@app.delete("/admin/dbquery/skills/{skill_id}", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_delete_skill(skill_id: str):
-    return backend_delete(f"/admin/dbquery/skills/{skill_id}", admin_key=_backend_admin_key())
-
-@app.get("/admin/dbquery/schedules", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_list_schedules():
-    return backend_get("/admin/dbquery/schedules", admin_key=_backend_admin_key())
-
-@app.post("/admin/dbquery/schedules", dependencies=[Depends(require_admin_key)])
-def proxy_admin_dbquery_upsert_schedule(payload: dict):
-    return backend_post("/admin/dbquery/schedules", admin_key=_backend_admin_key(), json_body=payload)
-
-# Concepts (currently implemented in the backend; proxied here so the UI can remain control-plane-only).
 @app.post("/admin/concepts/definitions", dependencies=[Depends(require_admin_key)])
-def proxy_admin_concepts_definitions(payload: dict):
-    return backend_post("/admin/concepts/definitions", admin_key=_backend_admin_key(), json_body=payload)
-
-@app.post("/admin/concepts/assignments", dependencies=[Depends(require_admin_key)])
-def proxy_admin_concepts_assignments(payload: dict):
-    return backend_post("/admin/concepts/assignments", admin_key=_backend_admin_key(), json_body=payload)
+def proxy_concepts_definitions_post(payload: dict = Body(...)):
+    return _proxy_call(lambda: backend_post("/admin/concepts/definitions", admin_key=_backend_admin_key(), json_body=payload))
 
 @app.get("/admin/concepts/assignments", dependencies=[Depends(require_admin_key)])
-def proxy_admin_concepts_list_assignments(request: Request):
-    return backend_get(
-        "/admin/concepts/assignments",
-        admin_key=_backend_admin_key(),
-        params=dict(request.query_params),
-    )
+def proxy_concepts_assignments_get():
+    return _proxy_call(lambda: backend_get("/admin/concepts/assignments", admin_key=_backend_admin_key()))
 
-@app.get("/admin/diag/routes", dependencies=[Depends(require_admin_key)])
-def admin_diag_routes():
-    """Lightweight route inventory to prevent 404 confusion in prod."""
-    out = []
-    for r in app.router.routes:
-        methods = getattr(r, "methods", None)
-        if not methods:
-            continue
-        out.append({"path": getattr(r, "path", ""), "name": getattr(r, "name", ""), "methods": sorted(list(methods))})
-    out.sort(key=lambda x: (x["path"], ",".join(x["methods"])))
-    return {"ok": True, "routes": out}
+@app.post("/admin/concepts/assignments", dependencies=[Depends(require_admin_key)])
+def proxy_concepts_assignments_post(payload: dict = Body(...)):
+    return _proxy_call(lambda: backend_post("/admin/concepts/assignments", admin_key=_backend_admin_key(), json_body=payload))
+
+
+# ============================================================
+# Proxy: DBQuery (backend is source-of-truth)
+# ============================================================
+
+@app.get("/admin/dbquery/entities", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_entities_get():
+    return _proxy_call(lambda: backend_get("/admin/dbquery/entities", admin_key=_backend_admin_key()))
+
+@app.post("/admin/dbquery/run", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_run(payload: dict = Body(...)):
+    return _proxy_call(lambda: backend_post("/admin/dbquery/run", admin_key=_backend_admin_key(), json_body=payload))
+
+@app.get("/admin/dbquery/skills", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_skills_get():
+    return _proxy_call(lambda: backend_get("/admin/dbquery/skills", admin_key=_backend_admin_key()))
+
+@app.post("/admin/dbquery/skills", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_skills_post(payload: dict = Body(...)):
+    return _proxy_call(lambda: backend_post("/admin/dbquery/skills", admin_key=_backend_admin_key(), json_body=payload))
+
+@app.delete("/admin/dbquery/skills/{skill_id}", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_skills_delete(skill_id: str):
+    return _proxy_call(lambda: backend_delete(f"/admin/dbquery/skills/{skill_id}", admin_key=_backend_admin_key()))
+
+@app.get("/admin/dbquery/schedules", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_schedules_get():
+    return _proxy_call(lambda: backend_get("/admin/dbquery/schedules", admin_key=_backend_admin_key()))
+
+@app.post("/admin/dbquery/schedules", dependencies=[Depends(require_admin_key)])
+def proxy_dbquery_schedules_post(payload: dict = Body(...)):
+    return _proxy_call(lambda: backend_post("/admin/dbquery/schedules", admin_key=_backend_admin_key(), json_body=payload))
 
 # ============================================================
 # Configuration Wizard endpoint (ChatGPT-style console)
