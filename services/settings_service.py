@@ -121,18 +121,35 @@ def set_enabled_gmail_account_ids(db: Session, user: User, account_ids: list[str
 # NEW: Skill config (modular)
 # -----------------------------
 def get_skills_config(db: Session, user: User) -> dict[str, dict]:
+    """
+    Return the per-tenant skills_config mapping.
+
+    Historical storage shapes in `user_settings.value` for key='skills_config':
+      A) {"skills": {...}}   (newer)
+      B) {...}              (older flat mapping)
+
+    We accept both to prevent the control-plane / WebUI from accidentally
+    overwriting and dropping dynamic skills.
+    """
     v = get_setting(db, user, "skills_config")
-    skills = (v or {}).get("skills")
-    if isinstance(skills, dict):
+
+    skills_obj: object | None = None
+    if isinstance(v, dict):
+        if isinstance(v.get("skills"), dict):
+            skills_obj = v.get("skills")
+        else:
+            # Flat mapping (legacy)
+            skills_obj = v
+
+    if isinstance(skills_obj, dict):
         out: dict[str, dict] = {}
-        for k, cfg in skills.items():
+        for k, cfg in skills_obj.items():
             if isinstance(k, str) and isinstance(cfg, dict):
                 out[k] = cfg
         return out
+
     # fall back to defaults
     return dict(DEFAULTS["skills_config"]["skills"])
-
-
 def patch_skill_config(db: Session, user: User, skill_id: str, patch: dict) -> dict[str, dict]:
     """
     Merge and persist a per-skill config patch.

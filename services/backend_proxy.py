@@ -14,7 +14,16 @@ import logging
 from typing import Any, Optional, Dict
 
 import httpx
-from fastapi import HTTPException
+class BackendProxyError(RuntimeError):
+    """Raised when the backend returns a non-2xx response."""
+
+    def __init__(self, *, status_code: int, method: str, url: str, detail: Any):
+        super().__init__(f"Backend error {status_code} for {method} {url}: {detail}")
+        self.status_code = status_code
+        self.method = method
+        self.url = url
+        self.detail = detail
+
 
 log = logging.getLogger("vozlia")
 
@@ -60,21 +69,16 @@ def backend_request(
         with httpx.Client(timeout=timeout_s, follow_redirects=True) as client:
             resp = client.request(method.upper(), url, headers=headers, json=json_body, params=params)
     except Exception as e:
-        log.exception("BACKEND_PROXY_REQUEST_FAILED method=%s url=%s", method, url)
-        raise HTTPException(status_code=502, detail=f"Backend request failed: {method} {url}: {e}") from e
+        raise RuntimeError(f"Backend request failed: {method} {url}: {e}") from e
 
     if resp.status_code < 200 or resp.status_code >= 300:
         # Try to include JSON error details if possible
+        detail = None
         try:
             detail = resp.json()
         except Exception:
             detail = resp.text[:1000]
-
-        # IMPORTANT:
-        # The control plane proxies should *pass through* backend HTTP errors (422/401/etc),
-        # not convert them into control-plane 500s.
-        log.warning("BACKEND_PROXY_NON_2XX method=%s url=%s status=%s detail=%s", method, url, resp.status_code, str(detail)[:500])
-        raise HTTPException(status_code=resp.status_code, detail=detail)
+        raise BackendProxyError(status_code=resp.status_code, method=method, url=url, detail=detail)
 
     # Some endpoints return empty bodies; normalize to {}.
     if not resp.content:

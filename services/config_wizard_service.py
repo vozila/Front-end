@@ -78,6 +78,7 @@ FilterOp = Literal[
     "between",
     "is_null",
     "not_null",
+    "has_concept",
 ]
 
 AggOp = Literal["count", "count_distinct", "sum", "avg", "min", "max"]
