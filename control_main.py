@@ -31,7 +31,7 @@ DEFAULT_GMAIL_SUMMARY_LLM_PROMPT = (
 
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.responses import StreamingResponse, JSONResponse
