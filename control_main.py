@@ -44,7 +44,7 @@ from db import Base, engine
 from core.security import encrypt_str
 from models import EmailAccount
 from services.user_service import get_or_create_primary_user
-from services.backend_proxy import backend_get, backend_post, backend_delete
+from services.backend_proxy import backend_get, backend_post, backend_delete, BackendProxyError
 from services.config_wizard_service import WizardTurnIn, WizardTurnOut, run_wizard_turn
 from services.settings_service import (
     get_agent_greeting,
@@ -85,7 +85,7 @@ def require_admin_key(
     x_vozlia_admin_key: str = Header(default="", alias="X-Vozlia-Admin-Key"),
     x_admin_key: str = Header(default="", alias="x-admin-key"),
     x_vozlia_trace: str = Header(default="", alias="X-Vozlia-Trace"),
-) -> bool:
+) -> str:
     expected = (os.getenv("ADMIN_API_KEY", "") or "").strip()
     if not expected:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
@@ -95,7 +95,7 @@ def require_admin_key(
         if DEBUG_RENDER_LOGS:
             logger.warning("ADMIN_AUTH_FAIL trace=%s", (x_vozlia_trace or "").strip() or None)
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
+    return provided
 
 
 # =========================
@@ -1477,12 +1477,27 @@ def admin_diag_regression(admin_key: str = Depends(require_admin_key)):
 
     # Render API checks (power Render Logs panel)
     def _render_services_check():
-        client = get_render_api()
-        services = client.list_services()
-        # Some accounts return dicts; normalize to list
-        if isinstance(services, dict) and "services" in services:
-            services = services["services"]
-        return {"ok": bool(services), "count": len(services) if isinstance(services, list) else None}
+        params: dict[str, Any] = {"limit": "10"}
+        owner_id = (_render_owner_id() or "").strip()
+        if owner_id:
+            params["ownerId"] = owner_id
+
+        data = _render_get_json_with_backoff("/v1/services", params=params)
+        items: list[Any] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = (data.get("services") or data.get("items") or [])
+
+        count = 0
+        for it in (items or []):
+            if not isinstance(it, dict):
+                continue
+            svc = it.get("service") if isinstance(it.get("service"), dict) else it
+            sid = str(svc.get("id") or "").strip()
+            if sid:
+                count += 1
+        return {"ok": count > 0, "count": count}
 
     _check("render: list services", _render_services_check)
 
