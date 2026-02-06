@@ -1,19 +1,14 @@
 # services/config_wizard_service.py
+"""VOZLIA FILE PURPOSE
+Purpose: Owner/admin portal "Configuration Wizard" (tool-first agent) that turns chat into validated JSON actions and executes them deterministically.
+Hot path: no (portal chat / admin endpoints only).
+Public interfaces: run_wizard_turn (used by /admin/wizard/turn), WizardTurnIn/WizardTurnOut schemas.
+Reads/Writes: user_settings (skills_config, skills_priority_order); backend admin endpoints via backend_proxy.
+Feature flags: OPENAI_WIZARD_MODEL (model selection); OPENAI_API_KEY must be present.
+Failure mode: Returns safe noop + explanation when planning/validation/backend calls fail.
+Last touched: 2026-02-06 (add has_concept / KB DBQuery guidance for menu + concept queries)
 """
-Configuration Wizard service (owner/admin only).
 
-This is a "tool-first" agent design:
-- LLM proposes *structured* actions (JSON).
-- Control plane validates and executes deterministic operations.
-- UI stays minimalist; capabilities live behind the wizard.
-
-This significantly reduces hallucinations vs. "freeform" LLM answers.
-
-Update (DB Query support):
-- Adds dbquery_run + dbquery_skill_create actions so the wizard can answer and/or
-  save internal analytics questions (calls, customers, KB docs, schedules, etc.)
-  using the backend /admin/dbquery/* endpoints.
-"""
 from __future__ import annotations
 
 import os
@@ -1089,6 +1084,25 @@ Example (calls this week):
     "filters":[{{"field":"kind","op":"eq","value":"turn"}},{{"field":"call_sid","op":"not_null"}}],
     "aggregations":[{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}],
     "limit":25
+  }},
+  "suggest_skill": false
+}}
+
+
+KB concept tag queries (has_concept):
+- Use op="has_concept" with a concept_code string (e.g. "menu.steak").
+- Entity/field mapping:
+  - entity="kb_chunks": field="id" (chunk is tagged) OR field="file_id" (file is tagged)
+  - entity="kb_files": field="id" (file is tagged)
+
+Example (KB chunks tagged menu.steak):
+{{ "type":"dbquery_run",
+  "spec":{{
+    "entity":"kb_chunks",
+    "select":["id","file_id","chunk_index","text"],
+    "filters":[{{"field":"id","op":"has_concept","value":"menu.steak"}}],
+    "order_by":[{{"field":"chunk_index","direction":"asc"}}],
+    "limit":50
   }},
   "suggest_skill": false
 }}
