@@ -1432,3 +1432,59 @@ def admin_wizard_turn(payload: WizardTurnIn, db: Session = Depends(get_db)):
     The LLM proposes structured actions; the control plane validates and executes them.
     """
     return run_wizard_turn(db, payload, admin_key=_backend_admin_key())
+
+
+# -----------------------------
+# Regression diagnostics
+# -----------------------------
+
+@app.get("/admin/diag/regression")
+def admin_diag_regression(admin_key: str = Depends(require_admin_key)):
+    """Lightweight health checks intended to catch WebUI regressions quickly.
+
+    Returns 200 with ok=true when all checks pass. Returns 200 with ok=false if any check fails.
+    (We intentionally do not raise here so the WebUI can render details.)
+    """
+    checks = []
+
+    def _check(name: str, fn):
+        t0 = time.time()
+        try:
+            out = fn()
+            ms = (time.time() - t0) * 1000.0
+
+            # Many of our admin endpoints return {ok: true}. Some return lists.
+            ok = True
+            detail = None
+            if isinstance(out, dict) and "ok" in out:
+                ok = bool(out.get("ok"))
+                detail = None if ok else out
+            elif out is None:
+                ok = False
+                detail = "no_response"
+
+            checks.append({"name": name, "ok": ok, "ms": ms, "status": 200, "detail": detail})
+        except Exception as e:
+            ms = (time.time() - t0) * 1000.0
+            checks.append({"name": name, "ok": False, "ms": ms, "status": None, "detail": str(e)})
+
+    # Backend proxy checks (these power wizard + skills lists)
+    _check("backend: /admin/websearch/skills", lambda: backend_get("/admin/websearch/skills", admin_key=admin_key))
+    _check("backend: /admin/websearch/schedules", lambda: backend_get("/admin/websearch/schedules", admin_key=admin_key))
+    _check("backend: /admin/dbquery/skills", lambda: backend_get("/admin/dbquery/skills", admin_key=admin_key))
+    _check("backend: /admin/dbquery/schedules", lambda: backend_get("/admin/dbquery/schedules", admin_key=admin_key))
+    _check("backend: /admin/dbquery/entities", lambda: backend_get("/admin/dbquery/entities", admin_key=admin_key))
+
+    # Render API checks (power Render Logs panel)
+    def _render_services_check():
+        client = get_render_api()
+        services = client.list_services()
+        # Some accounts return dicts; normalize to list
+        if isinstance(services, dict) and "services" in services:
+            services = services["services"]
+        return {"ok": bool(services), "count": len(services) if isinstance(services, list) else None}
+
+    _check("render: list services", _render_services_check)
+
+    ok = all(c.get("ok") for c in checks)
+    return {"ok": ok, "ts": datetime.utcnow().isoformat() + "Z", "checks": checks}

@@ -78,6 +78,7 @@ FilterOp = Literal[
     "between",
     "is_null",
     "not_null",
+    "has_concept",
 ]
 
 AggOp = Literal["count", "count_distinct", "sum", "avg", "min", "max"]
@@ -739,7 +740,7 @@ def _fastpath_calls_count(payload: WizardTurnIn) -> Optional[WizardPlan]:
         timeframe=DBTimeframe(preset=preset, timezone=tz),
         filters=[
             DBFilter(field="kind", op="eq", value="turn"),
-            DBFilter(field="call_sid", op="not_null"),
+            DBFilter(field="call_sid", op="not_null", value=None),
         ],
         aggregations=[agg],
         limit=25,
@@ -1067,7 +1068,8 @@ DBQuery spec guidance (STRICT JSON SHAPE):
 - Always choose an entity from the provided dbquery_entities context.
 - Only reference fields listed for that entity.
 - filters MUST be a list of objects like:
-  [{{"field":"kind","op":"eq","value":"turn"}}, {{"field":"call_sid","op":"not_null"}}]
+  [{{"field":"kind","op":"eq","value":"turn"}}, {{"field":"call_sid","op":"not_null",
+    "has_concept"}}]
 - aggregations MUST be a list of objects like:
   [{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}]
 - timeframe MUST be an object like:
@@ -1078,7 +1080,8 @@ Example (calls this week):
   "spec":{{
     "entity":"caller_memory_events",
     "timeframe":{{"preset":"this_week","timezone":"America/New_York"}},
-    "filters":[{{"field":"kind","op":"eq","value":"turn"}},{{"field":"call_sid","op":"not_null"}}],
+    "filters":[{{"field":"kind","op":"eq","value":"turn"}},{{"field":"call_sid","op":"not_null",
+    "has_concept"}}],
     "aggregations":[{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}],
     "limit":25
   }},
@@ -1232,10 +1235,13 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                     # Ensure entity consistency
                     spec = action.spec.model_dump()
                     spec["entity"] = action.entity
+                    name = action.name.strip()
+                    if not name.lower().startswith("db:"):
+                        name = f"DB: {name}" if name else "DB: Untitled"
                     out = backend_post(
                         "/admin/dbquery/skills",
                         admin_key=admin_key,
-                        json_body={"name": action.name, "entity": action.entity, "spec": spec, "triggers": action.triggers},
+                        json_body={"name": name, "entity": action.entity, "spec": spec, "triggers": action.triggers},
                     )
                     executed.append({"type": action.type, "created": out})
 
