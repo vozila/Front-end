@@ -1,14 +1,19 @@
 # services/config_wizard_service.py
-"""VOZLIA FILE PURPOSE
-Purpose: Owner/admin portal "Configuration Wizard" (tool-first agent) that turns chat into validated JSON actions and executes them deterministically.
-Hot path: no (portal chat / admin endpoints only).
-Public interfaces: run_wizard_turn (used by /admin/wizard/turn), WizardTurnIn/WizardTurnOut schemas.
-Reads/Writes: user_settings (skills_config, skills_priority_order); backend admin endpoints via backend_proxy.
-Feature flags: OPENAI_WIZARD_MODEL (model selection); OPENAI_API_KEY must be present.
-Failure mode: Returns safe noop + explanation when planning/validation/backend calls fail.
-Last touched: 2026-02-06 (add has_concept / KB DBQuery guidance for menu + concept queries)
 """
+Configuration Wizard service (owner/admin only).
 
+This is a "tool-first" agent design:
+- LLM proposes *structured* actions (JSON).
+- Control plane validates and executes deterministic operations.
+- UI stays minimalist; capabilities live behind the wizard.
+
+This significantly reduces hallucinations vs. "freeform" LLM answers.
+
+Update (DB Query support):
+- Adds dbquery_run + dbquery_skill_create actions so the wizard can answer and/or
+  save internal analytics questions (calls, customers, KB docs, schedules, etc.)
+  using the backend /admin/dbquery/* endpoints.
+"""
 from __future__ import annotations
 
 import os
@@ -27,7 +32,7 @@ from services.settings_service import (
     get_skills_priority_order,
     set_skills_priority_order,
 )
-from services.backend_proxy import backend_get, backend_post
+from services.backend_proxy import backend_get, backend_post, BackendProxyError
 
 try:
     from zoneinfo import ZoneInfo
@@ -236,6 +241,11 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #   The portal UI can still offer a "Save as skill" button.
 # - When enabled, the wizard may append a follow-up prompt to save/schedule.
 OFFER_SAVE_AFTER_QUERY = False  # hard-disabled (use UI Save-as-Skill button)
+
+# Feature flag:
+# - When enabled, some quantitative questions will be routed to the backend metrics engine.
+# - Default OFF to avoid breaking the wizard if the metrics endpoint is not deployed.
+WIZARD_METRICS_FASTPATH_ENABLED = _env_flag('WIZARD_METRICS_FASTPATH_ENABLED', '0')
 
 def _looks_like_metric_question(message: str) -> bool:
     t = (message or "").strip().lower()
@@ -1088,25 +1098,6 @@ Example (calls this week):
   "suggest_skill": false
 }}
 
-
-KB concept tag queries (has_concept):
-- Use op="has_concept" with a concept_code string (e.g. "menu.steak").
-- Entity/field mapping:
-  - entity="kb_chunks": field="id" (chunk is tagged) OR field="file_id" (file is tagged)
-  - entity="kb_files": field="id" (file is tagged)
-
-Example (KB chunks tagged menu.steak):
-{{ "type":"dbquery_run",
-  "spec":{{
-    "entity":"kb_chunks",
-    "select":["id","file_id","chunk_index","text"],
-    "filters":[{{"field":"id","op":"has_concept","value":"menu.steak"}}],
-    "order_by":[{{"field":"chunk_index","direction":"asc"}}],
-    "limit":50
-  }},
-  "suggest_skill": false
-}}
-
 Known built-in skill aliases:
 - gmail_summary: \"email summaries\", \"gmail summary\"
 - investment_reporting: \"investment report\", \"stock report\"
@@ -1204,21 +1195,40 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
 
     # Deterministic metrics fast-path: for quantitative questions, bypass LLM planning and call backend metrics engine.
     # This keeps portal troubleshooting aligned with voice metrics behavior (shared engine) and prevents numeric hallucinations.
-    if _looks_like_metric_question(payload.message) and not (("create" in payload.message.lower()) and ("skill" in payload.message.lower())):
+    # NOTE: This path is optional and MUST NOT break the wizard if the backend metrics endpoint isn't deployed.
+    if (
+        WIZARD_METRICS_FASTPATH_ENABLED
+        and _looks_like_metric_question(payload.message)
+        and not (('create' in payload.message.lower()) and ('skill' in payload.message.lower()))
+    ):
         tz = payload.default_timezone or DEFAULT_TIMEZONE
-        out = backend_post("/admin/metrics/run", admin_key=admin_key, json_body={"question": payload.message, "timezone": tz})
-        reply = out.get("spoken_summary") if isinstance(out, dict) else None
-        if not reply:
-            reply = "I can’t compute that metric yet from the current database."
-        return WizardTurnOut(
-            reply=reply,
-            actions_executed=[{"type": "metrics_run", "question": payload.message, "result": out}],
-            websearch_skills=ctx.get("websearch_skills", []),
-            websearch_schedules=ctx.get("websearch_schedules", []),
-            dbquery_skills=ctx.get("dbquery_skills", []),
-            dbquery_entities=ctx.get("dbquery_entities", {}),
-        )
-
+        try:
+            out = backend_post(
+                '/admin/metrics/run',
+                admin_key=admin_key,
+                json_body={'question': payload.message, 'timezone': tz},
+            )
+        except BackendProxyError as e:
+            # Metrics is a convenience; fall back to normal planning on any upstream error.
+            log.warning(
+                'WIZARD_METRICS_FASTPATH_FAILED status=%s url=%s detail=%s',
+                getattr(e, 'status_code', None),
+                getattr(e, 'url', None),
+                getattr(e, 'detail', None),
+            )
+        else:
+            reply = out.get('spoken_summary') if isinstance(out, dict) else None
+            if not reply:
+                reply = 'I can’t compute that metric yet from the current database.'
+            return WizardTurnOut(
+                reply=reply,
+                actions_executed=[{'type': 'metrics_run', 'question': payload.message, 'result': out}],
+                websearch_skills=ctx.get('websearch_skills', []),
+                websearch_schedules=ctx.get('websearch_schedules', []),
+                dbquery_skills=ctx.get('dbquery_skills', []),
+                dbquery_entities=ctx.get('dbquery_entities', {}),
+            )
+    
     plan = (
         _fastpath_save_followup(payload, ctx)
         or _fastpath_schedule_websearch(payload, ctx)
