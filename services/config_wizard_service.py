@@ -962,6 +962,25 @@ def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
     except Exception:
         dbquery_entities = {}
 
+    kb_concepts = []
+    try:
+        out = backend_post(
+            "/admin/dbquery/run",
+            json_body={"entity": "concept_assignments", "select": ["concept_code"], "limit": 200},
+            admin_key=admin_key,
+        )
+        rows = (out or {}).get("rows") or []
+        kb_concepts = sorted(
+            {
+                (r.get("concept_code") or "").strip()
+                for r in rows
+                if isinstance(r, dict) and (r.get("concept_code") or "").strip()
+            }
+        )
+    except Exception as e:
+        logger.warning("WIZARD_CONTEXT_KB_CONCEPTS_FAIL err=%s", str(e))
+        kb_concepts = []
+
     # Normalize to lists
     if not isinstance(websearch_skills, list):
         websearch_skills = []
@@ -978,6 +997,7 @@ def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
         "websearch_schedules": websearch_schedules,
         "dbquery_skills": dbquery_skills,
         "dbquery_entities": dbquery_entities,
+        "kb_concepts": kb_concepts,
     }
 
 
