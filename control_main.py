@@ -73,6 +73,16 @@ from admin_memory import build_memory_router
 
 
 logger = logging.getLogger("vozlia.control")
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Ensure callers always get JSON (prevents UI JSON.parse failures).
+    logger.exception("UNHANDLED_EXCEPTION path=%s", request.url.path, exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "detail": "Internal Server Error"},
+    )
+
 DEBUG_RENDER_LOGS = os.getenv("VOZLIA_DEBUG_RENDER_LOGS", "0") == "1"
 NY_TZ = ZoneInfo("America/New_York")
 
