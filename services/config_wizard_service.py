@@ -42,7 +42,6 @@ except Exception:  # pragma: no cover
 from openai import OpenAI
 
 log = logging.getLogger("vozlia")
-logger = log  # backward-compat alias (some code paths use `logger`)
 
 
 # -----------------------------
@@ -246,7 +245,7 @@ OFFER_SAVE_AFTER_QUERY = False  # hard-disabled (use UI Save-as-Skill button)
 # Feature flag:
 # - When enabled, some quantitative questions will be routed to the backend metrics engine.
 # - Default OFF to avoid breaking the wizard if the metrics endpoint is not deployed.
-WIZARD_METRICS_FASTPATH_ENABLED = _env_flag('WIZARD_METRICS_FASTPATH_ENABLED', '0')
+WIZARD_METRICS_FASTPATH_ENABLED = _env_flag('WIZARD_METRICS_FASTPATH_ENABLED', '1')
 
 def _looks_like_metric_question(message: str) -> bool:
     t = (message or "").strip().lower()
@@ -254,6 +253,37 @@ def _looks_like_metric_question(message: str) -> bool:
         return False
     hints = ("how many", "number of", "how often", "times", "count", "most", "top", "least")
     return any(h in t for h in hints)
+
+
+def _extract_explicit_concept_codes(message: str) -> List[str]:
+    """Extract explicit concept codes when the user says 'concept ...'.
+
+    We intentionally only trigger when the word 'concept' is present to avoid
+    accidentally treating domains or other dotted strings as concept codes.
+    """
+    t = (message or "").strip()
+    if not t or not re.search(r"\bconcept\b", t, flags=re.IGNORECASE):
+        return []
+
+    # Examples we want to capture: menu.steak, faq.delivery-hours
+    candidates = re.findall(r"\b([a-z][a-z0-9_-]*(?:\.[a-z0-9_-]+)+)\b", t, flags=re.IGNORECASE)
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for c in candidates:
+        c_norm = c.strip(".").lower()
+        # Defensive: avoid a couple common domains if they ever show up in text.
+        if c_norm in ("render.com", "onrender.com"):
+            continue
+        if c_norm not in seen:
+            seen.add(c_norm)
+            out.append(c_norm)
+    return out
+
+
+def _looks_like_count_request(message: str) -> bool:
+    t = (message or "").lower()
+    return any(k in t for k in ("how many", "count", "number of", "return just the count", "just the count"))
 
 
 _SKILL_ALIASES: Dict[str, List[str]] = {
@@ -1130,13 +1160,23 @@ Return JSON shape:
 
     messages.append({"role": "user", "content": payload.message[:4000]})
 
+    # Prefer JSON-mode if supported by the model/client; fall back gracefully.
+    req = {
+        "model": model,
+        "messages": messages,  # type: ignore
+        "temperature": 0,
+        "max_tokens": 850,
+    }
+    if os.getenv("WIZARD_LLM_JSON_MODE", "1") == "1":
+        req["response_format"] = {"type": "json_object"}
+
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,  # type: ignore
-            temperature=0,
-            max_tokens=850,
-        )
+        try:
+            resp = client.chat.completions.create(**req)
+        except TypeError:
+            # Older client/model combos may not accept response_format
+            req.pop("response_format", None)
+            resp = client.chat.completions.create(**req)
     except Exception as e:
         log.exception("CONFIG_WIZARD_LLM_CALL_FAIL")
         return WizardPlan(
@@ -1147,6 +1187,10 @@ Return JSON shape:
     content = (resp.choices[0].message.content or "").strip()
     data = _safe_json_loads(content)
     if not data:
+        if os.getenv("WIZARD_LOG_RAW_PLAN", "0") == "1":
+            log.warning("CONFIG_WIZARD_INVALID_JSON raw=%s", content[:4000])
+        else:
+            log.warning("CONFIG_WIZARD_INVALID_JSON (raw logging disabled) chars=%s", len(content))
         return WizardPlan(
             reply="I couldn’t produce a valid action plan. Please rephrase your request.",
             actions=[ActionNoop(reason="invalid_json")],
@@ -1167,7 +1211,10 @@ Return JSON shape:
         except Exception:
             pass
 
-        log.warning("CONFIG_WIZARD_PLAN_VALIDATION_FAIL data=%s err=%s", data, str(e))
+        if os.getenv("WIZARD_LOG_RAW_PLAN", "0") == "1":
+            log.warning("CONFIG_WIZARD_PLAN_VALIDATION_FAIL data=%s err=%s raw=%s", data, str(e), content[:4000])
+        else:
+            log.warning("CONFIG_WIZARD_PLAN_VALIDATION_FAIL data=%s err=%s", data, str(e))
         return WizardPlan(
             reply="I understood your request, but the action plan didn’t match the expected format. Please try again.",
             actions=[ActionNoop(reason="plan_schema_invalid")],
@@ -1230,6 +1277,60 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                 dbquery_entities=ctx.get('dbquery_entities', {}),
             )
     
+    # --- Explicit concept fastpath -------------------------------------------------
+    # If the user explicitly provides a concept code (e.g. "Use concept menu.steak"),
+    # bypass LLM planning and run a deterministic dbquery using has_concept.
+    concept_codes = _extract_explicit_concept_codes(payload.message)
+    if concept_codes:
+        concept_code = concept_codes[0]
+
+        # Prefer an existing dbquery skill's entity if it already references this concept.
+        entity = "kb_chunks"
+        for s in ctx.get("dbquery_skills", []) or []:
+            spec0 = (s or {}).get("spec") or {}
+            filters0 = spec0.get("filters") or []
+            if any((f or {}).get("op") == "has_concept" and str((f or {}).get("value") or "").lower() == concept_code for f in filters0):
+                entity = spec0.get("entity") or entity
+                break
+
+        is_count = _looks_like_count_request(payload.message)
+        spec: Dict[str, Any] = {
+            "entity": entity,
+            "filters": [{"field": "id", "op": "has_concept", "value": concept_code}],
+        }
+
+        if is_count:
+            spec["aggregations"] = [{"op": "count_distinct", "field": "id", "as_name": "count"}]
+            spec["limit"] = 1
+        else:
+            if entity == "kb_chunks":
+                spec["select"] = ["id", "file_id", "chunk_index", "text"]
+                spec["order_by"] = [{"field": "chunk_index", "direction": "asc"}]
+            spec["limit"] = 50
+
+        try:
+            result = backend_post("/admin/dbquery/run", admin_key=admin_key, json_body={"spec": spec}, timeout_s=20)
+        except BackendProxyError as e:
+            log.warning(
+                "WIZARD_CONCEPT_FASTPATH_FAILED status=%s url=%s detail=%s",
+                getattr(e, "status_code", None),
+                getattr(e, "url", None),
+                getattr(e, "detail", None),
+            )
+        else:
+            reply = result.get("spoken_summary") if isinstance(result, dict) else None
+            if not reply:
+                reply = "Done."
+            return WizardTurnOut(
+                reply=reply,
+                actions_executed=[{"type": "dbquery_run", "spec": spec, "result": result}],
+                websearch_skills=ctx.get("websearch_skills", []),
+                websearch_schedules=ctx.get("websearch_schedules", []),
+                dbquery_skills=ctx.get("dbquery_skills", []),
+                dbquery_entities=ctx.get("dbquery_entities", {}),
+            )
+
+
     plan = (
         _fastpath_save_followup(payload, ctx)
         or _fastpath_schedule_websearch(payload, ctx)
