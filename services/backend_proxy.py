@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 from typing import Any, Optional, Dict
 
 import httpx
+
+from core.request_context import get_request_id
+from core.logging import env_flag
 class BackendProxyError(RuntimeError):
     """Raised when the backend returns a non-2xx response."""
 
@@ -26,6 +30,15 @@ class BackendProxyError(RuntimeError):
 
 
 log = logging.getLogger("vozlia")
+
+def _proxy_debug_enabled() -> bool:
+    # Common debug gate (inherits VOZLIA_DEBUG if BACKEND_PROXY_DEBUG is unset).
+    return env_flag("BACKEND_PROXY_DEBUG", "0", inherit_debug=True)
+
+
+def _proxy_debug_prefixes() -> list[str]:
+    raw = (os.getenv("BACKEND_PROXY_DEBUG_PREFIXES") or "/admin/dbquery,/admin/metrics,/admin/websearch").strip()
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
 
 def _backend_base_url() -> str:
@@ -58,18 +71,49 @@ def backend_request(
     base = _backend_base_url()
     url = f"{base}{path if path.startswith('/') else '/' + path}"
 
+    prefixes = _proxy_debug_prefixes()
+    debug = _proxy_debug_enabled() and any(path.startswith(p) for p in prefixes)
+    t0 = time.perf_counter()
+
     headers = {
         "X-Vozlia-Admin-Key": admin_key,
         "Accept": "application/json",
+        # Correlation across Control -> Backend.
+        "X-Vozlia-Request-Id": get_request_id(),
     }
     if json_body is not None:
         headers["Content-Type"] = "application/json"
+
+    if debug:
+        try:
+            log.info(
+                "BACKEND_PROXY_CALL method=%s path=%s url=%s params=%s has_body=%s",
+                method.upper(),
+                path,
+                url,
+                (sorted(list((params or {}).keys())) if isinstance(params, dict) else None),
+                bool(json_body is not None),
+            )
+        except Exception:
+            pass
 
     try:
         with httpx.Client(timeout=timeout_s, follow_redirects=True) as client:
             resp = client.request(method.upper(), url, headers=headers, json=json_body, params=params)
     except Exception as e:
         raise RuntimeError(f"Backend request failed: {method} {url}: {e}") from e
+
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    if debug:
+        try:
+            log.info(
+                "BACKEND_PROXY_RESP status=%s ms=%.1f ctype=%s",
+                resp.status_code,
+                dt_ms,
+                (resp.headers.get('content-type') or ''),
+            )
+        except Exception:
+            pass
 
     if resp.status_code < 200 or resp.status_code >= 300:
         # Try to include JSON error details if possible

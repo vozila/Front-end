@@ -33,6 +33,7 @@ from services.settings_service import (
     set_skills_priority_order,
 )
 from services.backend_proxy import backend_get, backend_post, BackendProxyError
+from core.logging import env_flag
 
 try:
     from zoneinfo import ZoneInfo
@@ -42,6 +43,9 @@ except Exception:  # pragma: no cover
 from openai import OpenAI
 
 log = logging.getLogger("vozlia")
+
+WIZARD_DEBUG_LOGS = env_flag("WIZARD_DEBUG_LOGS", "0", inherit_debug=True)
+
 
 
 # -----------------------------
@@ -918,6 +922,11 @@ def _fastpath_save_followup(payload: WizardTurnIn, ctx: Dict[str, Any]) -> Optio
         preset = "this_week"
         tz = payload.default_timezone or DEFAULT_TIMEZONE
         try:
+            if WIZARD_DEBUG_LOGS:
+                log.info("WIZARD_METRICS_FASTPATH_TAKE tz=%s", tz)
+        except Exception:
+            pass
+        try:
             if p.actions[0].spec.timeframe and p.actions[0].spec.timeframe.preset:
                 preset = str(p.actions[0].spec.timeframe.preset)
             if p.actions[0].spec.timeframe and p.actions[0].spec.timeframe.timezone:
@@ -1227,6 +1236,15 @@ Return JSON shape:
 
 def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnOut:
     """Main entry point used by /admin/wizard/turn."""
+    # Minimal breadcrumb so Render logs show the exact branch taken per wizard call.
+    # Keep message truncated to avoid leaking large payloads into logs.
+    try:
+        _msg_snip = ((payload.message or "").replace("\n", " ")[:240]).strip()
+    except Exception:
+        _msg_snip = ""
+    if WIZARD_DEBUG_LOGS:
+        log.info("WIZARD_TURN_IN msg=%r dry_run=%s has_history=%s", _msg_snip, bool(payload.dry_run), bool(payload.messages))
+
     user = get_or_create_primary_user(db)
 
     # Load context once (skills & websearch/dbquery inventory). This is also used for id resolution.
@@ -1250,6 +1268,11 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
         and not (('create' in payload.message.lower()) and ('skill' in payload.message.lower()))
     ):
         tz = payload.default_timezone or DEFAULT_TIMEZONE
+        try:
+            if WIZARD_DEBUG_LOGS:
+                log.info("WIZARD_METRICS_FASTPATH_TAKE tz=%s", tz)
+        except Exception:
+            pass
         try:
             out = backend_post(
                 '/admin/metrics/run',
@@ -1283,6 +1306,12 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
     concept_codes = _extract_explicit_concept_codes(payload.message)
     if concept_codes:
         concept_code = concept_codes[0]
+
+        try:
+            if WIZARD_DEBUG_LOGS:
+                log.info("WIZARD_CONCEPT_FASTPATH_TAKE concept=%s", concept_code)
+        except Exception:
+            pass
 
         # Prefer an existing dbquery skill's entity if it already references this concept.
         entity = "kb_chunks"
@@ -1337,6 +1366,15 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
         or _plan_with_llm(payload, ctx)
     )
 
+    try:
+        _types = []
+        for a in (plan.actions or []):
+            _types.append(getattr(a, "type", type(a).__name__))
+        if WIZARD_DEBUG_LOGS:
+            log.info("WIZARD_PLAN_OK actions=%s", _types)
+    except Exception:
+        pass
+
     executed: List[Dict[str, Any]] = []
     if payload.dry_run:
         executed.append({"type": "dry_run", "note": "No changes executed."})
@@ -1346,6 +1384,16 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                 if isinstance(action, ActionWebSearchRun):
                     out = backend_post("/admin/websearch/search", admin_key=admin_key, json_body={"query": action.query})
                     executed.append({"type": action.type, "query": action.query, "result": out})
+                    if WIZARD_DEBUG_LOGS:
+                        try:
+                            n_items = None
+                            if isinstance(out, dict):
+                                items = out.get('items')
+                                if isinstance(items, list):
+                                    n_items = len(items)
+                            log.info('WIZARD_ACTION_RESULT type=websearch_run items=%s', n_items)
+                        except Exception:
+                            pass
 
                 elif isinstance(action, ActionWebSearchSkillCreate):
                     out = backend_post(
@@ -1378,6 +1426,17 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                         json_body={"spec": action.spec.model_dump()},
                     )
                     executed.append({"type": action.type, "spec": action.spec.model_dump(), "result": out})
+                    if WIZARD_DEBUG_LOGS:
+                        try:
+                            log.info(
+                                'WIZARD_ACTION_RESULT type=dbquery_run ok=%s entity=%s count=%s rows=%s',
+                                (out.get('ok') if isinstance(out, dict) else None),
+                                (out.get('entity') if isinstance(out, dict) else None),
+                                (out.get('count') if isinstance(out, dict) else None),
+                                (len(out.get('rows') or []) if isinstance(out, dict) and isinstance(out.get('rows'), list) else None),
+                            )
+                        except Exception:
+                            pass
 
                 elif isinstance(action, ActionDBQuerySkillCreate):
                     # Ensure entity consistency
@@ -1461,6 +1520,15 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
 
     # Return fresh state snapshots for the UI
     ctx2 = _build_context_snapshot(db, user, admin_key=admin_key)
+    if WIZARD_DEBUG_LOGS:
+        try:
+            log.info(
+                'WIZARD_TURN_OUT reply_len=%s actions_executed=%s',
+                (len((plan.reply or '')) if isinstance(plan.reply, str) else None),
+                ([e.get('type') for e in executed] if isinstance(executed, list) else None),
+            )
+        except Exception:
+            pass
     return WizardTurnOut(
         reply=plan.reply,
         actions_executed=executed,
