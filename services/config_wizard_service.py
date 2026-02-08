@@ -42,6 +42,63 @@ except Exception:  # pragma: no cover
 
 from openai import OpenAI
 
+
+def _patch_openai_by_alias_none() -> None:
+    """Workaround for an upstream SDK issue.
+
+    Some versions of openai-python (and other httpx+pydantic SDKs) can end up passing
+    by_alias=None into pydantic's model_dump(), which raises:
+
+        TypeError: argument 'by_alias': 'NoneType' object cannot be converted to 'PyBool'
+
+    This patch coerces by_alias=None -> False inside openai._compat helpers.
+    Safe: no behavior change when by_alias is already a bool.
+    """
+    try:
+        import openai._compat as _compat  # type: ignore
+    except Exception:
+        return
+
+    # Idempotent: only patch once per process.
+    try:
+        if getattr(_compat, "_vozlia_by_alias_patch", False):
+            return
+    except Exception:
+        pass
+
+    try:
+        orig_model_dump = getattr(_compat, "model_dump", None)
+        if callable(orig_model_dump):
+            def _model_dump_patched(model, *args, **kwargs):
+                if kwargs.get("by_alias", False) is None:
+                    kwargs["by_alias"] = False
+                return orig_model_dump(model, *args, **kwargs)
+            _compat.model_dump = _model_dump_patched  # type: ignore
+    except Exception:
+        # Don't fail the wizard due to a logging/compat patch.
+        return
+
+    # Some SDKs also expose model_json_schema; patch similarly if present.
+    try:
+        orig_schema = getattr(_compat, "model_json_schema", None)
+        if callable(orig_schema):
+            def _model_json_schema_patched(model, *args, **kwargs):
+                if kwargs.get("by_alias", False) is None:
+                    kwargs["by_alias"] = False
+                return orig_schema(model, *args, **kwargs)
+            _compat.model_json_schema = _model_json_schema_patched  # type: ignore
+    except Exception:
+        pass
+
+    try:
+        setattr(_compat, "_vozlia_by_alias_patch", True)
+    except Exception:
+        pass
+
+
+# Apply at import time so the first wizard call is safe.
+_patch_openai_by_alias_none()
+
 log = logging.getLogger("vozlia")
 
 WIZARD_DEBUG_LOGS = env_flag("WIZARD_DEBUG_LOGS", "0", inherit_debug=True)
