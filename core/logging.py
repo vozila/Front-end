@@ -105,6 +105,20 @@ except Exception:
     pass
 
 
+
+
+# Reduce noise from verbose third-party libraries, even when LOG_LEVEL=DEBUG.
+# These libraries can emit hundreds of lines per request when their loggers are set to DEBUG.
+# Opt-in to their debug logs via HTTPX_DEBUG=1 and/or OPENAI_SDK_DEBUG=1.
+try:
+    if not env_flag("HTTPX_DEBUG", "0"):
+        for _n in ("httpcore", "httpcore.connection", "httpcore.http11", "httpx"):
+            logging.getLogger(_n).setLevel(logging.WARNING)
+    if not env_flag("OPENAI_SDK_DEBUG", "0"):
+        logging.getLogger("openai").setLevel(logging.WARNING)
+except Exception:
+    pass
+
 # Vozlia app logger
 logger = logging.getLogger("vozlia")
 logger.setLevel(LEVEL)
