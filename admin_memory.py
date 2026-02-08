@@ -351,7 +351,14 @@ def build_memory_router(require_admin_key) -> APIRouter:
                 )
             )
 
-        next_since = (max_ts_ms + 1) if (max_ts_ms is not None and not has_more) else max_ts_ms
+        # Cursor for polling:
+        # - If we returned rows and there's no pagination, advance past the last seen timestamp (+1 ms).
+        # - If we returned rows but has_more=True, keep cursor at max_ts_ms (client can keep paging).
+        # - If we returned *no* rows, keep the caller-provided since_ms so the client doesn't thrash back to full fetch.
+        if max_ts_ms is None:
+            next_since = since_ms
+        else:
+            next_since = (max_ts_ms + 1) if (not has_more) else max_ts_ms
         return TurnEventListOut(items=items, has_more=has_more, next_since_ms=next_since)
 
     return router

@@ -35,7 +35,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from core.logging import env_flag
+
 logger = logging.getLogger("kb_query")
+
+KB_QUERY_DEBUG = env_flag("KB_QUERY_DEBUG", "0", inherit_debug=True)
+
 
 Mode = Literal["retrieve", "answer"]
 
@@ -426,6 +431,22 @@ def register_kb_query_routes(app, require_admin, get_db) -> None:
     ) -> KBQueryResponse:
         t0 = time.perf_counter()
 
+        if KB_QUERY_DEBUG:
+            try:
+                q_prev = (req.query or '').replace('\n', ' ').strip()
+                if len(q_prev) > 200:
+                    q_prev = q_prev[:200] + '…'
+                logger.info(
+                    'KB_QUERY_IN tenant_id=%s mode=%s limit=%s include_policy=%s query=%r',
+                    req.tenant_id,
+                    req.mode,
+                    req.limit,
+                    bool(req.include_policy),
+                    q_prev,
+                )
+            except Exception:
+                pass
+
         tenant_id = (req.tenant_id or "").strip()
         if not tenant_id:
             raise HTTPException(status_code=400, detail="tenant_id is required")
@@ -439,11 +460,21 @@ def register_kb_query_routes(app, require_admin, get_db) -> None:
 
         # Retrieve knowledge
         strategy, rows = _retrieve_knowledge(db, tenant_id=tenant_id, query=req.query, limit=req.limit)
+        if KB_QUERY_DEBUG:
+            try:
+                logger.info('KB_QUERY_RETRIEVAL strategy=%s rows=%s', strategy, len(rows or []))
+            except Exception:
+                pass
         sources, _raw_context_chars = _rows_to_sources(rows)
 
         # Build context for model
         max_context_chars = int(os.getenv("KB_QA_MAX_CONTEXT_CHARS", "12000"))
         context_text, used_context_chars = _build_context(rows, max_chars=max_context_chars)
+        if KB_QUERY_DEBUG:
+            try:
+                logger.info('KB_QUERY_GROUNDING evidence=%s policy_chars=%s context_chars=%s', bool(context_text.strip()), policy_chars, used_context_chars)
+            except Exception:
+                pass
 
         answer: Optional[str] = None
         model: Optional[str] = None
@@ -460,6 +491,12 @@ def register_kb_query_routes(app, require_admin, get_db) -> None:
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
+        if KB_QUERY_DEBUG:
+            try:
+                ans_len = len(answer or '') if isinstance(answer, str) else 0
+                logger.info('KB_QUERY_OUT ok=%s sources=%s answer_len=%s ms=%.1f', bool(answer), len(sources), ans_len, (time.perf_counter()-t0)*1000.0)
+            except Exception:
+                pass
         return KBQueryResponse(
             ok=True,
             tenant_id=tenant_id,

@@ -19,6 +19,7 @@ import random
 import urllib.error
 import socket
 import datetime as dt
+from uuid import uuid4
 from datetime import datetime, timedelta
 from typing import List, Optional, Iterator, Any, Dict
 
@@ -42,6 +43,9 @@ from sqlalchemy import text
 from deps import get_db
 from db import Base, engine
 from core.security import encrypt_str
+from core.logging import logger as _boot_logger  # init logging early
+from core.logging import env_flag, is_debug
+from core.request_context import set_request_id, reset_request_id, get_request_id
 from models import EmailAccount
 from services.user_service import get_or_create_primary_user
 from services.backend_proxy import backend_get, backend_post, backend_delete, BackendProxyError
@@ -354,26 +358,117 @@ def _kb_startup_selfcheck() -> None:
 
 @app.middleware("http")
 async def trace_middleware(request: Request, call_next):
-    trace = request.headers.get("x-vozlia-trace") or request.headers.get("X-Vozlia-Trace")
+    """Request correlation + optional HTTP diagnostics (Render log friendly).
+
+    - Sets per-request request_id in contextvars so all logs include rid=...
+    - Propagates X-Vozlia-Request-Id (and X-Vozlia-Trace for backwards compatibility).
+    - Optional request/response logs for specific prefixes (CONTROL_HTTP_DIAG_* env vars).
+    """
+    # Prefer upstream ids if present.
+    rid = (
+        (request.headers.get("x-vozlia-request-id") or "").strip()
+        or (request.headers.get("x-request-id") or "").strip()
+        or (request.headers.get("x-vozlia-trace") or "").strip()
+        or str(uuid4())
+    )
+    token = set_request_id(rid)
+
+    # Optional "trace" header for older UI wiring.
+    trace = (request.headers.get("x-vozlia-trace") or request.headers.get("X-Vozlia-Trace") or "").strip() or None
+
+    diag_enabled = env_flag("CONTROL_HTTP_DIAG_ENABLED", "0", inherit_debug=True)
+    prefixes_raw = (os.getenv("CONTROL_HTTP_DIAG_PREFIXES", "") or "").strip()
+    diag_prefixes = [p.strip() for p in prefixes_raw.split(",") if p.strip()]
+    diag_log_body = (os.getenv("CONTROL_HTTP_DIAG_LOG_BODY", "0") or "0").strip() in ("1", "true", "yes", "on")
+    try:
+        diag_max_body = int((os.getenv("CONTROL_HTTP_DIAG_MAX_BODY_CHARS", "2000") or "2000").strip() or "2000")
+    except Exception:
+        diag_max_body = 2000
+
+    # If VOZLIA_DEBUG is on and no prefixes were provided, default to /admin (but see excludes below).
+    if diag_enabled and not diag_prefixes:
+        diag_prefixes = ["/admin"]
+
+    exclude_raw = (os.getenv("CONTROL_HTTP_DIAG_EXCLUDE_PREFIXES") or "/admin/memory/turns").strip()
+    exclude_prefixes = [p.strip() for p in exclude_raw.split(",") if p.strip()]
+
+    wants_diag = bool(
+        diag_enabled
+        and diag_prefixes
+        and any(request.url.path.startswith(p) for p in diag_prefixes)
+        and not any(request.url.path.startswith(p) for p in exclude_prefixes)
+    )
     t0 = time.monotonic()
+
+    body_preview = None
+    if wants_diag and diag_log_body:
+        try:
+            b = await request.body()
+            if b:
+                body_preview = b[: max(0, diag_max_body)].decode("utf-8", errors="replace")
+        except Exception:
+            body_preview = None
+
+    if wants_diag:
+        try:
+            logger.info(
+                "HTTP_DIAG_IN method=%s path=%s qs=%s trace=%s body=%s",
+                request.method,
+                request.url.path,
+                request.url.query,
+                trace,
+                (body_preview if body_preview is not None else None),
+            )
+        except Exception:
+            pass
+
     try:
         resp = await call_next(request)
     except Exception:
+        # Keep Render debug signal, but include rid for correlation.
+        if wants_diag:
+            try:
+                logger.exception("HTTP_DIAG_EXCEPTION path=%s trace=%s", request.url.path, trace)
+            except Exception:
+                pass
         if DEBUG_RENDER_LOGS and request.url.path.startswith("/admin/render"):
             logger.exception("RENDER_ADMIN_REQUEST_EXCEPTION trace=%s path=%s", trace, request.url.path)
         raise
-    dt_ms = (time.monotonic() - t0) * 1000.0
+    finally:
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        if wants_diag:
+            try:
+                logger.info(
+                    "HTTP_DIAG_OUT method=%s path=%s status=%s ms=%.1f trace=%s",
+                    request.method,
+                    request.url.path,
+                    getattr(locals().get("resp"), "status_code", None),
+                    dt_ms,
+                    trace,
+                )
+            except Exception:
+                pass
+        if DEBUG_RENDER_LOGS and request.url.path.startswith("/admin/render"):
+            logger.info(
+                "RENDER_ADMIN %s %s status=%s ms=%.1f trace=%s",
+                request.method,
+                request.url.path,
+                getattr(locals().get("resp"), "status_code", None),
+                dt_ms,
+                trace,
+            )
+        reset_request_id(token)
+
+    # Expose request id to callers (and preserve trace header behavior).
+    try:
+        resp.headers["X-Vozlia-Request-Id"] = rid
+    except Exception:
+        pass
     if trace:
-        resp.headers["X-Vozlia-Trace"] = trace
-    if DEBUG_RENDER_LOGS and request.url.path.startswith("/admin/render"):
-        logger.info(
-            "RENDER_ADMIN %s %s status=%s ms=%.1f trace=%s",
-            request.method,
-            request.url.path,
-            getattr(resp, "status_code", None),
-            dt_ms,
-            trace,
-        )
+        try:
+            resp.headers["X-Vozlia-Trace"] = trace
+        except Exception:
+            pass
     return resp
 
 
