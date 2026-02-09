@@ -33,6 +33,7 @@ from services.settings_service import (
     set_skills_priority_order,
 )
 from services.backend_proxy import backend_get, backend_post, BackendProxyError
+from services.wizard_grounding import rewrite_dbquery_spec_for_kb, build_grounded_reply_and_citations
 from core.logging import env_flag
 
 try:
@@ -278,6 +279,8 @@ class WizardPlan(BaseModel):
 class WizardTurnOut(BaseModel):
     reply: str
     actions_executed: List[Dict[str, Any]] = Field(default_factory=list)
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    grounding: Dict[str, Any] = Field(default_factory=dict)
     # Fresh state snapshots for UI refresh
     websearch_skills: List[Dict[str, Any]] = Field(default_factory=list)
     websearch_schedules: List[Dict[str, Any]] = Field(default_factory=list)
@@ -293,6 +296,12 @@ class WizardTurnOut(BaseModel):
 
 DEFAULT_TIMEZONE = "America/New_York"
 
+# Cache the expensive backend inventory calls the wizard needs (skills/schedules/entities).
+# This reduces control-plane log volume and avoids spamming the backend during UI polling.
+WIZARD_CONTEXT_CACHE_TTL_S = int((os.getenv("WIZARD_CONTEXT_CACHE_TTL_S") or "10").strip() or "10")
+_WIZARD_CONTEXT_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
 def _env_flag(name: str, default: str = "0") -> bool:
     v = (os.getenv(name, default) or default).strip().lower()
     return v in ("1", "true", "yes", "y", "on")
@@ -306,14 +315,35 @@ OFFER_SAVE_AFTER_QUERY = False  # hard-disabled (use UI Save-as-Skill button)
 # Feature flag:
 # - When enabled, some quantitative questions will be routed to the backend metrics engine.
 # - Default OFF to avoid breaking the wizard if the metrics endpoint is not deployed.
+# Feature flag:
+# - When enabled, some quantitative questions will be routed to the backend metrics engine.
+# - Default ON for now; can be disabled if the backend metrics endpoint is not deployed.
 WIZARD_METRICS_FASTPATH_ENABLED = _env_flag('WIZARD_METRICS_FASTPATH_ENABLED', '1')
+
+# Tighten the "metrics" detector so KB/menu questions (e.g. “how many steak dishes on the menu?”)
+# do not get misrouted to the metrics engine.
+WIZARD_METRICS_FASTPATH_STRICT = _env_flag('WIZARD_METRICS_FASTPATH_STRICT', '1')
+
+_METRIC_HINTS = ("how many", "number of", "how often", "times", "count", "unique", "most", "top", "least", "total")
+_METRICS_TARGET_HINTS = ("caller", "call", "calls", "lead", "leads", "conversation", "conversations", "turn", "turns", "message", "messages", "sms", "voicemail", "email")
+_KB_EXCLUDE_HINTS = ("menu", "dish", "dishes", "beverage", "drink", "drinks", "coffee", "smoothie", "steak", "salad", "sandwich")
 
 def _looks_like_metric_question(message: str) -> bool:
     t = (message or "").strip().lower()
     if not t:
         return False
-    hints = ("how many", "number of", "how often", "times", "count", "most", "top", "least")
-    return any(h in t for h in hints)
+
+    if not any(h in t for h in _METRIC_HINTS):
+        return False
+
+    if WIZARD_METRICS_FASTPATH_STRICT:
+        # If it's clearly a KB/menu question, do not send it through metrics.
+        if any(h in t for h in _KB_EXCLUDE_HINTS):
+            return False
+        return any(h in t for h in _METRICS_TARGET_HINTS)
+
+    # Legacy heuristic: any count-like phrase triggers metrics.
+    return True
 
 
 def _extract_explicit_concept_codes(message: str) -> List[str]:
@@ -1033,7 +1063,31 @@ def _fastpath_save_followup(payload: WizardTurnIn, ctx: Dict[str, Any]) -> Optio
     )
 
 
-def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
+def _build_context_snapshot(db, user, admin_key: str, *, force_refresh: bool = False) -> Dict[str, Any]:
+    """Build (or reuse) the wizard context snapshot.
+
+    This snapshot is used to:
+    - provide the LLM planner with current skill/schedule inventories
+    - resolve IDs in follow-up actions
+    - refresh the UI after a mutating action (skill create/schedule upsert)
+
+    To reduce log volume + backend churn, we cache this snapshot briefly.
+    """
+    # Cache key is per-user (single-tenant today, but keep the key explicit).
+    user_id = getattr(user, "id", None) or "primary"
+    cache_key = f"wizard_ctx:{user_id}"
+    now = time.time()
+
+    if not force_refresh and WIZARD_CONTEXT_CACHE_TTL_S > 0:
+        hit = _WIZARD_CONTEXT_CACHE.get(cache_key)
+        if hit:
+            ts, snap = hit
+            if (now - ts) < WIZARD_CONTEXT_CACHE_TTL_S and isinstance(snap, dict):
+                # Keep now_utc fresh even when the rest of the snapshot is cached.
+                out = dict(snap)
+                out["now_utc"] = datetime.utcnow().isoformat() + "Z"
+                return out
+
     skills_config = get_skills_config(db, user)
     skills_priority = get_skills_priority_order(db, user)
 
@@ -1067,7 +1121,7 @@ def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
     if not isinstance(dbquery_skills, list):
         dbquery_skills = []
 
-    return {
+    snap = {
         "now_utc": datetime.utcnow().isoformat() + "Z",
         "skills_config": skills_config,
         "skills_priority_order": skills_priority,
@@ -1076,6 +1130,11 @@ def _build_context_snapshot(db, user, admin_key: str) -> Dict[str, Any]:
         "dbquery_skills": dbquery_skills,
         "dbquery_entities": dbquery_entities,
     }
+
+    if WIZARD_CONTEXT_CACHE_TTL_S > 0:
+        _WIZARD_CONTEXT_CACHE[cache_key] = (now, snap)
+
+    return snap
 
 
 def _plan_with_llm(payload: WizardTurnIn, context: Dict[str, Any]) -> WizardPlan:
@@ -1178,10 +1237,10 @@ DBQuery spec guidance (STRICT JSON SHAPE):
 - Only reference fields listed for that entity.
 - filters MUST be a list of objects like:
   [{{"field":"kind","op":"eq","value":"turn"}}, {{"field":"call_sid","op":"not_null"}}]
+- timeframe is OPTIONAL: include it for time-bounded event tables. For kb_chunks/kb_files, OMIT timeframe (created_at is ingestion time).
+- For kb_chunks, search content via {{"field":"text","op":"icontains","value":"<keyword>"}} and do NOT use kind for content labels.
 - aggregations MUST be a list of objects like:
   [{{"op":"count_distinct","field":"call_sid","as_name":"calls"}}]
-- timeframe MUST be an object like:
-  {{"preset":"this_week","timezone":"America/New_York"}}
 
 Example (calls this week):
 {{ "type":"dbquery_run",
@@ -1477,12 +1536,16 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                     executed.append({"type": action.type, "scheduled": out})
 
                 elif isinstance(action, ActionDBQueryRun):
+                    spec_dict = action.spec.model_dump()
+                    spec2, meta = rewrite_dbquery_spec_for_kb(spec_dict, payload.message)
+                    if WIZARD_DEBUG_LOGS and meta.get('changed'):
+                        log.info('WIZARD_DBQUERY_REWRITE notes=%s', meta.get('notes'))
                     out = backend_post(
                         "/admin/dbquery/run",
                         admin_key=admin_key,
-                        json_body={"spec": action.spec.model_dump()},
+                        json_body={"spec": spec2},
                     )
-                    executed.append({"type": action.type, "spec": action.spec.model_dump(), "result": out})
+                    executed.append({"type": action.type, "spec": spec2, "result": out, "rewrite": meta if meta.get('changed') else None})
                     if WIZARD_DEBUG_LOGS:
                         try:
                             log.info(
@@ -1524,28 +1587,18 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
                 log.exception("CONFIG_WIZARD_ACTION_EXEC_FAIL type=%s", getattr(action, "type", "action"))
                 executed.append({"type": getattr(action, "type", "action"), "error": str(e)})
 
-    # If we executed a websearch_run/dbquery_run, prefer returning the backend-produced answer/summary.
+    # Build a grounded reply (with citations) from executed tool outputs.
+    citations: List[Dict[str, Any]] = []
+    grounding: Dict[str, Any] = {}
     try:
-        for ex in executed:
-            if ex.get("type") == "websearch_run":
-                res = ex.get("result") or {}
-                if isinstance(res, dict) and isinstance(res.get("answer"), str) and res.get("answer").strip():
-                    if len(plan.actions) == 1 and getattr(plan.actions[0], "type", None) == "websearch_run":
-                        plan.reply = res["answer"].strip()
-                    else:
-                        plan.reply = (plan.reply.rstrip() + "\n\n" + res["answer"].strip()).strip()
-                    break
-            if ex.get("type") == "dbquery_run":
-                res = ex.get("result") or {}
-                spoken = None
-                if isinstance(res, dict):
-                    spoken = res.get("spoken_summary") or None
-                if isinstance(spoken, str) and spoken.strip():
-                    if len(plan.actions) == 1 and getattr(plan.actions[0], "type", None) == "dbquery_run":
-                        plan.reply = spoken.strip()
-                    else:
-                        plan.reply = (plan.reply.rstrip() + "\n\n" + spoken.strip()).strip()
-                    break
+        grounded_reply, citations, grounding = build_grounded_reply_and_citations(payload.message, executed)
+        if isinstance(grounded_reply, str) and grounded_reply.strip():
+            plan.reply = grounded_reply.strip()
+        if WIZARD_DEBUG_LOGS:
+            log.info(
+                'WIZARD_GROUNDING mode=%s refused=%s evidence=%s citations=%s',
+                grounding.get('mode'), grounding.get('refused'), grounding.get('evidence_count'), grounding.get('citations_count')
+            )
     except Exception:
         pass
 
@@ -1576,7 +1629,20 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
             pass
 
     # Return fresh state snapshots for the UI
-    ctx2 = _build_context_snapshot(db, user, admin_key=admin_key)
+    # Only refresh the expensive context snapshot after mutating actions.
+    _MUTATING_ACTIONS = {
+        "websearch_skill_create",
+        "websearch_schedule_upsert",
+        "dbquery_skill_create",
+        "skill_config_patch",
+        "skills_priority_set",
+    }
+    needs_refresh = any((e.get("type") in _MUTATING_ACTIONS) for e in (executed or []))
+    ctx2 = (
+        _build_context_snapshot(db, user, admin_key=admin_key, force_refresh=True)
+        if needs_refresh
+        else ctx
+    )
     if WIZARD_DEBUG_LOGS:
         try:
             log.info(
@@ -1589,6 +1655,8 @@ def run_wizard_turn(db, payload: WizardTurnIn, *, admin_key: str) -> WizardTurnO
     return WizardTurnOut(
         reply=plan.reply,
         actions_executed=executed,
+        citations=citations,
+        grounding=grounding,
         websearch_skills=ctx2.get("websearch_skills") or [],
         websearch_schedules=ctx2.get("websearch_schedules") or [],
         dbquery_skills=ctx2.get("dbquery_skills") or [],

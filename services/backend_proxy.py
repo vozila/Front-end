@@ -1,12 +1,14 @@
 # services/backend_proxy.py
+"""VOZLIA FILE PURPOSE
+Purpose: Thin HTTP client used by the control plane to call the backend admin API with request-id correlation.
+Hot path: no (admin/control-plane only).
+Public interfaces: backend_get(), backend_post(), BackendProxyError.
+Reads/Writes: Network I/O to backend; stdout logs.
+Feature flags: BACKEND_PROXY_DEBUG, BACKEND_PROXY_DEBUG_PREFIXES.
+Failure mode: Raises BackendProxyError on non-2xx responses.
+Last touched: 2026-02-09 (default debug prefixes narrowed to tool endpoints)
 """
-Thin HTTP client for Vozlia backend.
 
-Design goals:
-- Keep control plane as the only surface exposed to the web UI.
-- Forward admin auth via the existing X-Vozlia-Admin-Key header.
-- Fail loudly but with actionable errors.
-"""
 from __future__ import annotations
 
 import os
@@ -18,6 +20,8 @@ import httpx
 
 from core.request_context import get_request_id
 from core.logging import env_flag
+
+
 class BackendProxyError(RuntimeError):
     """Raised when the backend returns a non-2xx response."""
 
@@ -37,7 +41,7 @@ def _proxy_debug_enabled() -> bool:
 
 
 def _proxy_debug_prefixes() -> list[str]:
-    raw = (os.getenv("BACKEND_PROXY_DEBUG_PREFIXES") or "/admin/dbquery,/admin/metrics,/admin/websearch").strip()
+    raw = (os.getenv("BACKEND_PROXY_DEBUG_PREFIXES") or "/admin/dbquery/run,/admin/metrics/run,/admin/websearch/search").strip()
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
