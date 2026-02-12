@@ -182,13 +182,45 @@ def _first_match_index(text: str, terms: List[str]) -> Tuple[Optional[int], Opti
 
 
 
-def _safe_snippet(s: str, *, max_chars: int = 220) -> str:
-    t = (s or "").replace("\n", " ").strip()
-    t = re.sub(r"\s+", " ", t)
-    if len(t) <= max_chars:
-        return t
-    return t[: max_chars - 1].rstrip() + "…"
+def _safe_snippet(text: str, max_len: int = 220, terms: Optional[List[str]] = None) -> str:
+    """Return a short, display-safe snippet.
 
+    If `terms` is provided, the snippet will be *centered* on the first match (case-insensitive)
+    so the snippet is representative of why the row matched (important for KB evidence).
+    """
+    if not text:
+        return ""
+
+    # Normalize control characters and whitespace so match logic is stable across ingestion artifacts.
+    s = text.replace("\x7f", " ").replace("\u007f", " ")
+    s = " ".join(s.split())
+    if not s:
+        return ""
+
+    if terms:
+        low = s.lower()
+        for t in terms:
+            if not t:
+                continue
+            t_low = t.lower()
+            idx = low.find(t_low)
+            if idx != -1:
+                half = max_len // 2
+                start = max(0, idx - half)
+                end = min(len(s), start + max_len)
+                if end - start < max_len and start > 0:
+                    start = max(0, end - max_len)
+                snip = s[start:end].strip()
+                if start > 0:
+                    snip = "… " + snip
+                if end < len(s):
+                    snip = snip + " …"
+                return snip
+
+    snip = s[:max_len].strip()
+    if len(s) > max_len:
+        snip += " …"
+    return snip
 
 def rewrite_dbquery_spec_for_kb(spec: Dict[str, Any], message: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Rewrite obviously-wrong KB dbquery specs into a safer text search.
@@ -320,7 +352,7 @@ def _render_sources_md(citations: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _citations_from_dbquery_kb_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _citations_from_dbquery_kb_rows(rows: List[Dict[str, Any]], terms: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for r in rows[: WIZARD_CITATIONS_MAX]:
         if not isinstance(r, dict):
@@ -444,11 +476,11 @@ def build_grounded_reply_and_citations(
 
         # KB-specific presentation
         if entity == "kb_chunks":
+            spec = chosen.get("spec") or {}
+            if not isinstance(spec, dict):
+                spec = {}
+            terms = _extract_terms_from_dbquery_spec(spec, message)
             if WIZARD_DEBUG_PROOF:
-                spec = chosen.get("spec") or {}
-                if not isinstance(spec, dict):
-                    spec = {}
-                terms = _extract_terms_from_dbquery_spec(spec, message)
                 try:
                     filt = spec.get("filters")
                     # Keep this compact; filters can be large but should be small for kb_chunks queries.
@@ -459,16 +491,15 @@ def build_grounded_reply_and_citations(
                     if not isinstance(r, dict):
                         continue
                     txt = str(r.get("text") or "")
-                    snip = _safe_snippet(txt)
+                    snip = _safe_snippet(txt, terms=terms)
                     idx, term = _first_match_index(txt, terms)
                     rid = r.get("id") or "?"
                     if idx is None:
                         logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match=none snip_len=%s", rid, len(snip))
-                    elif idx >= len(snip):
-                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match_term=%s match_idx=%s snip_len=%s in_snippet=%s", rid, term, idx, len(snip), False)
                     else:
-                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match_term=%s match_idx=%s snip_len=%s in_snippet=%s", rid, term, idx, len(snip), True)
-            citations.extend(_citations_from_dbquery_kb_rows(rows))
+                        in_snip = bool(term) and (term.lower() in snip.lower())
+                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match_term=%s match_idx=%s snip_len=%s in_snippet=%s", rid, term, idx, len(snip), in_snip)
+            citations.extend(_citations_from_dbquery_kb_rows(rows, terms=terms))
             grounding["citations_count"] = len(citations)
 
             if not rows:
@@ -482,7 +513,7 @@ def build_grounded_reply_and_citations(
             for i, r in enumerate(rows[:10], start=1):
                 if not isinstance(r, dict):
                     continue
-                snip = _safe_snippet(str(r.get("text") or ""))
+                snip = _safe_snippet(str(r.get("text") or ""), terms=terms)
                 cid = r.get("id") or "?"
                 lines.append(f"{i}. ({cid}) {snip}")
             reply = "\n".join(lines) + _render_sources_md(citations if WIZARD_REQUIRE_CITATIONS else [])
