@@ -14,7 +14,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.logging import env_flag
+from core.logging import env_flag, logger
 
 # -------------------------
 # Flags (safe-by-default)
@@ -31,6 +31,9 @@ WIZARD_CITATIONS_MAX = int((os.getenv("WIZARD_CITATIONS_MAX") or "8").strip() or
 WIZARD_KBQUERY_REWRITE_ENABLED = env_flag("WIZARD_KBQUERY_REWRITE_ENABLED", "1", inherit_debug=False)
 
 
+
+# Common proof logging gate (inherits VOZLIA_DEBUG).
+WIZARD_DEBUG_PROOF = env_flag("VOZLIA_DEBUG_PROOF", "0", inherit_debug=True)
 # -------------------------
 # Tokenization helpers
 # -------------------------
@@ -113,6 +116,70 @@ _ALLOWED_KINDS = {
     # common menu-ish schemas (future-proof)
     "header", "item", "description",
 }
+
+
+
+def _extract_terms_from_dbquery_spec(spec: Dict[str, Any], message: str) -> List[str]:
+    """Best-effort extraction of the user's intended search term(s) for proof logging.
+
+    This is *not* used to change query behavior; it only helps us explain why a KB chunk matched
+    even if the displayed snippet doesn't show the term near the beginning.
+    """
+    terms: List[str] = []
+    try:
+        filters = spec.get("filters")
+        if isinstance(filters, list):
+            for f in filters:
+                if not isinstance(f, dict):
+                    continue
+                field = str(f.get("field") or "").strip().lower()
+                op = str(f.get("op") or "").strip().lower()
+                val = f.get("value")
+                if field == "text" and isinstance(val, str) and val.strip():
+                    # For ilike patterns, strip SQL wildcards.
+                    v = val.strip()
+                    if op in ("ilike", "like"):
+                        v = v.replace("%", "").replace("_", "")
+                    terms.append(v.lower())
+    except Exception:
+        pass
+
+    # Fallback: keyword(s) from the original message (deterministic, no external calls).
+    if not terms:
+        try:
+            terms = _tokens(message, max_tokens=6)
+        except Exception:
+            terms = []
+
+    # De-dupe while preserving order
+    out: List[str] = []
+    seen = set()
+    for t in terms:
+        tt = (t or "").strip().lower()
+        if not tt:
+            continue
+        if tt in seen:
+            continue
+        seen.add(tt)
+        out.append(tt)
+    return out
+
+
+def _first_match_index(text: str, terms: List[str]) -> Tuple[Optional[int], Optional[str]]:
+    if not text or not terms:
+        return None, None
+    lower = text.lower()
+    best_i: Optional[int] = None
+    best_t: Optional[str] = None
+    for t in terms:
+        i = lower.find(t.lower())
+        if i < 0:
+            continue
+        if best_i is None or i < best_i:
+            best_i = i
+            best_t = t
+    return best_i, best_t
+
 
 
 def _safe_snippet(s: str, *, max_chars: int = 220) -> str:
@@ -377,6 +444,30 @@ def build_grounded_reply_and_citations(
 
         # KB-specific presentation
         if entity == "kb_chunks":
+            if WIZARD_DEBUG_PROOF:
+                spec = chosen.get("spec") or {}
+                if not isinstance(spec, dict):
+                    spec = {}
+                terms = _extract_terms_from_dbquery_spec(spec, message)
+                try:
+                    filt = spec.get("filters")
+                    # Keep this compact; filters can be large but should be small for kb_chunks queries.
+                    logger.info("WIZARD_KB_DEBUG_PROOF entity=kb_chunks terms=%s filters=%s rows=%s", terms, filt, len(rows))
+                except Exception:
+                    pass
+                for r in rows[:10]:
+                    if not isinstance(r, dict):
+                        continue
+                    txt = str(r.get("text") or "")
+                    snip = _safe_snippet(txt)
+                    idx, term = _first_match_index(txt, terms)
+                    rid = r.get("id") or "?"
+                    if idx is None:
+                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match=none snip_len=%s", rid, len(snip))
+                    elif idx >= len(snip):
+                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match_term=%s match_idx=%s snip_len=%s in_snippet=%s", rid, term, idx, len(snip), False)
+                    else:
+                        logger.info("WIZARD_KB_SNIPPET_PROOF row_id=%s match_term=%s match_idx=%s snip_len=%s in_snippet=%s", rid, term, idx, len(snip), True)
             citations.extend(_citations_from_dbquery_kb_rows(rows))
             grounding["citations_count"] = len(citations)
 
